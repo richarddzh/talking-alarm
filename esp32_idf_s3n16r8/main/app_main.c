@@ -19,6 +19,7 @@
 #include "gui_shell.h"
 #include "app_chat_alarm.h"
 #include "app_settings.h"
+#include "app_radio.h"
 #include "app_tetris.h"
 #include "app_snake.h"
 #include "wifi_creds.h"
@@ -28,6 +29,7 @@
 #include "audio_io.h"
 #include "voice_chat.h"
 #include "chime_player.h"
+#include "radio_player.h"
 #include "mem_log.h"
 
 static const char *TAG = "app";
@@ -85,7 +87,7 @@ static void render_home(void);
 static void set_setup_ap(bool on);
 
 static bool audio_activity_busy(void) {
-    return voice_chat_busy() || chime_player_busy() ||
+    return voice_chat_busy() || chime_player_busy() || radio_player_busy() ||
            audio_io_phase() != AUDIO_PHASE_IDLE;
 }
 
@@ -361,7 +363,8 @@ static void poll_rtc_time(void) {
 }
 
 static bool trigger_chime(const char *reason, const char *time_arg) {
-    if (voice_chat_busy() || chime_player_busy() || audio_io_phase() != AUDIO_PHASE_IDLE) {
+    if (voice_chat_busy() || chime_player_busy() || radio_player_busy() ||
+        audio_io_phase() != AUDIO_PHASE_IDLE) {
         return false;
     }
     if (!wifi_time_has_credentials()) {
@@ -425,6 +428,7 @@ static void maybe_dispatch_scheduled_chime(void) {
 static void set_setup_ap(bool on) {
     if (on == s_setup_mode) return;
     if (on) {
+        radio_player_stop(4000);
         wifi_time_disconnect();
         mem_log("ap pre");
         if (wifi_provision_start() == ESP_OK) {
@@ -483,7 +487,7 @@ static void dispatch_gui_action(gui_action_t action) {
         sync_time_from_wifi("settings");
         break;
     case GUI_ACTION_START_VOICE:
-        if (voice_chat_busy() || chime_player_busy() ||
+        if (voice_chat_busy() || chime_player_busy() || radio_player_busy() ||
             audio_io_phase() != AUDIO_PHASE_IDLE) {
             snprintf(s_status_msg, sizeof(s_status_msg), "audio busy");
             break;
@@ -507,6 +511,33 @@ static void dispatch_gui_action(gui_action_t action) {
             voice_chat_stop_and_process();
         }
         break;
+    case GUI_ACTION_RADIO_TOGGLE: {
+        size_t station = app_radio_selected_station();
+        radio_player_snapshot_t snapshot;
+        radio_player_get_snapshot(&snapshot);
+        if (radio_player_busy()) {
+            if (radio_player_stop(4000) != ESP_OK) {
+                snprintf(s_status_msg, sizeof(s_status_msg),
+                         "radio stop timeout");
+                break;
+            }
+            if (snapshot.station_index == station) break;
+        }
+        if (voice_chat_busy() || chime_player_busy() ||
+            audio_io_phase() != AUDIO_PHASE_IDLE) {
+            snprintf(s_status_msg, sizeof(s_status_msg), "audio busy");
+            break;
+        }
+        if (!wifi_time_has_credentials()) {
+            set_setup_ap(true);
+            break;
+        }
+        if (!ensure_wifi_connected("radio")) break;
+        if (radio_player_start(station) != ESP_OK) {
+            snprintf(s_status_msg, sizeof(s_status_msg), "radio start fail");
+        }
+        break;
+    }
     case GUI_ACTION_NONE:
     default:
         break;
@@ -621,12 +652,14 @@ static void initialise(void) {
     ESP_ERROR_CHECK(rtc_ds3231_init());
     ESP_ERROR_CHECK(voice_chat_init());
     ESP_ERROR_CHECK(chime_player_init());
+    ESP_ERROR_CHECK(radio_player_init());
     voice_chat_set_status_cb(voice_status_changed_cb, NULL);
     chime_player_set_status_cb(chime_status_changed_cb, NULL);
     chime_player_set_text_cb(chime_text_received_cb, NULL);
 
     const gui_app_t *apps[] = {
         app_chat_alarm_descriptor(),
+        app_radio_descriptor(),
         app_settings_descriptor(),
         app_tetris_descriptor(),
         app_snake_descriptor(),

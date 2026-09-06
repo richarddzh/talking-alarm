@@ -7,3 +7,4 @@ __pycache__/
 *.zip
 esp32_idf_s3n16r8/build/
 esp32_idf_s3n16r8/build-*/
+esp32_idf_s3n16r8/managed_components/

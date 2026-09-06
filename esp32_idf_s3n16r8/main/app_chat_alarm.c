@@ -1,6 +1,7 @@
 #include "app_chat_alarm.h"
 
 #include "app_config.h"
+#include "ui_cat_avatar.h"
 #include "ui_screen.h"
 #include "voice_chat.h"
 
@@ -149,21 +150,6 @@ static void wrap_text(const char *text, int max_width,
     }
 }
 
-static void draw_cat_avatar(int x, int y, bool from_user) {
-    ui_color_t bg = from_user ? UI_COLOR_PRIMARY : UI_COLOR_WARNING;
-    ui_fill_round_rect(x, y, 30, 30, 7, bg);
-    ui_fill_triangle(x + 5, y + 8, x + 8, y + 1, x + 13, y + 8, bg);
-    ui_fill_triangle(x + 17, y + 8, x + 22, y + 1, x + 25, y + 8, bg);
-    ui_fill_circle(x + 11, y + 14, 3, UI_COLOR_WHITE);
-    ui_fill_circle(x + 20, y + 14, 3, UI_COLOR_WHITE);
-    ui_fill_circle(x + 12, y + 14, 1, UI_COLOR_BLACK);
-    ui_fill_circle(x + 19, y + 14, 1, UI_COLOR_BLACK);
-    ui_fill_triangle(x + 14, y + 19, x + 17, y + 19,
-                     x + 15, y + 21, UI_COLOR_DANGER);
-    ui_draw_line(x + 15, y + 22, x + 11, y + 24, UI_COLOR_BLACK);
-    ui_draw_line(x + 16, y + 22, x + 20, y + 24, UI_COLOR_BLACK);
-}
-
 static void draw_bubble(int y, const chat_message_t *message) {
     const int width = 238;
     const int height = 40;
@@ -174,7 +160,7 @@ static void draw_bubble(int y, const chat_message_t *message) {
     ui_color_t border =
         message->from_user ? UI_COLOR_PRIMARY : UI_COLOR_PANEL_ALT;
 
-    draw_cat_avatar(avatar_x, y + 5, message->from_user);
+    ui_draw_cat_avatar(avatar_x, y + 4, message->from_user);
     ui_fill_round_rect(x, y, width, height, 8, background);
     if (message->from_user) {
         ui_fill_triangle(x + width - 2, y + 21, x + width + 9, y + 27,

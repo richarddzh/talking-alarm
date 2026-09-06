@@ -2,17 +2,21 @@
 
 面向 ESP32-S3 N16R8 的模块化闲聊闹钟固件。设备使用 ST7789 320×240
 屏幕、双核音频流水线、模拟摇杆、DS3231 RTC 和豆包 ASR / Agent / TTS，
-并内置设置、俄罗斯方块和贪吃蛇 App。
+并内置网络电台、设置、俄罗斯方块和贪吃蛇 App。
 
 ## 功能
 
 - 闲聊闹钟：长按主按钮录音，执行 ASR → Agent → TTS；摇杆按钮可请求
   一次 Chime。用户文本、Agent 回复、手动 Chime、随机 Chime 和整点播报
   都进入统一聊天记录，以带猫咪头像和尖角的圆角气泡显示。
+- 猫咪头像直接使用参考图猫头区域缩放并量化后的固定 32×32 位图，运行时
+  逐像素贴图，不再用圆、线和三角形重新绘制。
 - 二维焦点导航：摇杆 `X/Y` 是 ADC 模拟轴，分别生成左/右和上/下事件；
   `B` 是独立数字按键。每个 App 声明显式焦点邻接表，轴移动永不生成确认。
 - Wi-Fi 状态栏：连接时显示向上的多圆弧扇形；断线时显示带叹号的空心扇形。
 - TFT 使用上一帧差分和局部区域提交，避免内容变化时反复整屏刷新造成闪烁。
+- 网络电台：内置动感101、Love Radio、经典947、上海交通广播和上海新闻
+  广播；使用 Espressif 官方 MP3 解码组件，并按广播原始采样率输出 I2S。
 - 俄罗斯方块：七种彩色形状、左侧游戏区、右侧积分/消行/下一块提示和开始按钮。
 - 贪吃蛇：方向化头部、身体、转角和尾部块，绿色红斑蛇身、眼睛、舌头和红苹果。
 - SoftAP 配网、SNTP 校时、DS3231 本地走时、整点播报和安静模式。
@@ -28,15 +32,20 @@ esp32_idf_s3n16r8/
 │   ├── gui_shell.[ch]          主界面、当前 App 路由、状态栏
 │   ├── app_chat_alarm.[ch]     聊天气泡、历史和语音交互
 │   ├── app_settings.[ch]       设置 App
+│   ├── app_radio.[ch]          网络电台列表和播放状态
+│   ├── radio_player.[ch]       Core 0 HTTP/MP3 解码 worker
+│   ├── radio_stations.[ch]     集中管理电台目录
 │   ├── app_tetris.[ch]         俄罗斯方块 App
 │   ├── app_snake.[ch]          贪吃蛇 App
 │   ├── ui_screen.[ch]          4-bit 画布和基础图元
+│   ├── ui_cat_avatar.[ch]      原创蓝灰猫咪头像组件
 │   ├── audio_io.[ch]           Core 1 高优先级 I2S
 │   └── ...                     Wi-Fi、RTC、ASR、Agent、TTS
 └── docs/
     ├── joystick_focus_navigation.md
     ├── games_design.md
     ├── display_refresh.md
+    ├── network_radio_design.md
     └── modular_app_gui_design.md
 ```
 

@@ -33,6 +33,7 @@ typedef enum {
     GUI_ACTION_SYNC_TIME,
     GUI_ACTION_START_VOICE,
     GUI_ACTION_STOP_VOICE,
+    GUI_ACTION_RADIO_TOGGLE,
 } gui_action_t;
 
 #define GUI_FOCUS_HOME (-1)

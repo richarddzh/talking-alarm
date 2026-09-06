@@ -236,7 +236,10 @@ static esp_err_t tts_http_event(esp_http_client_event_t *e) {
 
     switch (e->event_id) {
     case HTTP_EVENT_ON_CONNECTED:
-        audio_io_clear_speaker_ring();
+        if (audio_io_prepare_speaker(APP_DOUBAO_TTS_SAMPLE_RATE, 1) != ESP_OK) {
+            ctx->stream_error = true;
+            return ESP_FAIL;
+        }
         report_status(ctx, "wait tts");
         break;
     case HTTP_EVENT_ON_DATA:

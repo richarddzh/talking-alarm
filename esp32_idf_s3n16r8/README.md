@@ -14,6 +14,7 @@ Arduino 版在录音/播放时丢帧明显，主要原因是 Arduino-ESP32 在 `
 - 原生 320×240、16 色索引 GUI；38.4 KB framebuffer 放在 PSRAM
 - 完整 GNU Unifont BMP 中文点阵字体 + UTF-8 渲染
 - 模块化 App Shell、手机式图标主导航和固定底部状态栏
+- Espressif 官方 MP3 解码器驱动的网络电台 App
 - `esp_wifi` + `esp_event` 直接控制 Wi-Fi STA/AP 切换；连接失败时自动进入设备自建热点配置模式
 
 ## Core 分工（已在 sdkconfig.defaults 显式声明）
@@ -21,7 +22,7 @@ Arduino 版在录音/播放时丢帧明显，主要原因是 Arduino-ESP32 在 `
 | 任务                    | 默认/配置                              | 实际所在 Core |
 |-------------------------|----------------------------------------|----------------|
 | `app_main` / 主循环     | `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y` | **Core 0**    |
-| `voice_worker` / `chime_worker` | `xTaskCreatePinnedToCore(..., 0)` | **Core 0** |
+| `voice_worker` / `chime_worker` / `radio_player` | `xTaskCreatePinnedToCore(..., 0)` | **Core 0** |
 | Wi-Fi 任务              | `CONFIG_ESP_WIFI_TASK_CORE_ID=0`       | **Core 0**    |
 | lwIP TCP/IP 任务        | `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` | **Core 0**  |
 | `audio_io` （I2S 收发） | `xTaskCreatePinnedToCore(..., 1)` + `configMAX_PRIORITIES - 1` | **Core 1** |
@@ -44,7 +45,7 @@ SPSC ring**（`main/ring.[ch]`），同步只靠：
 | 阶段       | 生产者              | 消费者              | 共享 64 KB arena 当作 |
 |-----------|---------------------|---------------------|------------------------------|
 | RECORD    | audio task (Core 1) | voice pipeline (Core 0) | mic ring                 |
-| PLAY      | TTS worker (Core 0) | audio task (Core 1) | spk ring                     |
+| PLAY      | TTS 或 MP3 worker (Core 0) | audio task (Core 1) | spk ring                |
 
 由于 RECORD 和 PLAY **永远不会同时发生**（长按单按钮录音 → 松开 → 上传 →
 等回包 → 播放，是一个完整的串行序列），所以同一块 64 KB 内存先被录音
@@ -70,7 +71,7 @@ ESP-IDF capability 规则使用 PSRAM。
 | mbedTLS 一次握手 + 应用流              | 20–30 KB *     |
 | FreeRTOS 内核 + ROM 保留               | ~30 KB         |
 | 本应用音频 arena                       | **64 KB**      |
-| 本应用 I2S DMA（mic 12 KB + spk 8 KB） | **20 KB**      |
+| 本应用 I2S DMA（mic 12 KB；spk mono 8 KB / stereo 16 KB） | **20–28 KB** |
 | 本应用各任务栈 (audio 4K + main 6K)    | 10 KB          |
 | UI framebuffer + 其它静态缓冲          | ~5 KB          |
 | **小计已分配**                         | **214–224 KB** |
@@ -92,7 +93,8 @@ authmode 设成 `MBEDTLS_SSL_VERIFY_NONE`，**完全不解析证书链、不查
   风险。板载 8 MB PSRAM 已启用；若后续把 arena 改为动态 capability
   分配，可将大缓冲移入 PSRAM，但 I2S DMA 缓冲必须保留在内部 SRAM。
 - **I2S DMA 描述符已经放大**到 mic 6×512 frame（12 KB DMA / 96 ms 采集
-  窗口）和 spk 8×512 frame（8 KB DMA / 256 ms 播放窗口）。这意味着即使
+  窗口）和 spk 8×512 frame（16 kHz mono 时 8 KB；44.1 kHz stereo 时
+  16 KB / 约 93 ms 播放窗口）。这意味着即使
   audio task 因为 SPI flash 操作或缓存抖动被挤掉 50–100 ms，DMA 也不会
   溢出/欠运行。继续放大需要消耗 `MALLOC_CAP_DMA` 池（ESP32 总共约
   110 KB，要给 Wi-Fi DMA 留 30–40 KB），所以默认到此为止；如果实测
@@ -188,6 +190,9 @@ I (12345) mem: <tag> heap=NNN min=NNN int=NNN dma=NNN dma_max=NNN
 - **`doubao_tts_player.c`** —— 直连豆包 TTS API，消费返回 JSON 字节流，
    只识别 `data` 字段，把 base64 PCM 每 4 个字符一组解码并推进 spk ring，
    不缓存整行 JSON，也不经过 App Service 代理音频流。
+- **`radio_player.c`** —— 在 Core 0 用 `esp_http_client` 读取 MP3 直播流，
+  通过 Espressif `esp_audio_codec` 解码为 PCM，预缓冲后交给 Core 1 I2S；
+  采样率和声道由首个解码帧动态配置。
 
 ### Doubao API keys
 
@@ -255,6 +260,7 @@ GUI 操作：
 - 摇杆 B：默认作为可重映射的辅助确认键。
 - X/Y 方向事件与确认事件在输入适配层分离，不会触发按钮按下动作。
 - 只有闲聊闹钟 App 的动作卡会把确认映射为 Chime；其它 App 执行各自操作。
+- 网络电台 App 中上下选择电台，确认键播放；再次确认当前电台即停止。
 - 闲聊闹钟 App 内按住主按钮 800 ms：开始麦克风录音，松开后执行 ASR → Agent → TTS 并播放回复；最长录音 10 秒。
 - 配置模式按住 800 ms：关闭临时热点并尝试连接已保存的 Wi-Fi；连接失败会自动回到配置模式。
 - 正常联网时不能通过按钮主动打开配置热点；无凭据或连接失败时固件会自动进入配置模式。
@@ -346,6 +352,9 @@ esp32_wifi_alarm_idf/
     ├── gui_app.h           App 描述符、输入和动作接口
     ├── gui_shell.[ch]      主导航、焦点路由和底部状态栏
     ├── app_chat_alarm.[ch] 闲聊闹钟 App
+    ├── app_radio.[ch]      网络电台列表与状态界面
+    ├── radio_player.[ch]   Core 0 HTTP/MP3 解码 worker
+    ├── radio_stations.[ch] 电台目录
     ├── app_settings.[ch]   设置 App
     ├── st7789.[ch]         ST7789 TFT 驱动
     ├── font5x7.[ch]        ASCII 5x7 字体（475 B）

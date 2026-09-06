@@ -47,13 +47,15 @@ static volatile uint8_t  s_req_stop  = 0;
 static volatile uint8_t  s_req_abort = 0;
 static volatile uint32_t s_mic_overflow_chunks = 0;
 static volatile uint32_t s_spk_underrun = 0;
+static volatile uint32_t s_spk_sample_rate = APP_VOICE_SAMPLE_RATE;
+static volatile uint8_t  s_spk_channels = 1;
 
 // --- Reusable scratch buffers (kept off the task stack) -----------------
 // 与下面 install_mic / install_speaker 的 dma_frame_num 对齐：每次
 // i2s_channel_read 直接吃掉一整个 DMA 描述符，少做 syscall。
 static int32_t s_i2s_read_buf[512];     // 2 KB mic DMA staging (512 frame * 4 B)
 static int16_t s_decimate_buf[256];     // 512 B 32->16 kHz, 32->16 bit
-static uint8_t s_i2s_write_buf[1024];   // 1 KB speaker DMA staging (512 frame * 2 B)
+static uint8_t s_i2s_write_buf[2048];   // 2 KB speaker staging (512 stereo frames)
 
 // --- I2S handles --------------------------------------------------------
 static i2s_chan_handle_t s_mic_chan;
@@ -110,9 +112,10 @@ static void uninstall_mic(void) {
 
 static esp_err_t install_speaker(void) {
     if (s_spk_installed) return ESP_OK;
+    uint32_t sample_rate = s_spk_sample_rate;
+    uint8_t channels = s_spk_channels;
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(SPK_PORT, I2S_ROLE_MASTER);
-    // spk 端: 8 * 512 frame * 2 B = 8 KB DMA, 约 256 ms 播放窗口 @ 16 kHz
-    // TLS read 偶发的 100-200 ms 长阻塞期间, DMA 仍能持续推音频。
+    // Eight 512-frame descriptors retain about 93 ms at 44.1 kHz stereo.
     chan_cfg.dma_desc_num = 8;
     chan_cfg.dma_frame_num = 512;
     chan_cfg.auto_clear = true;
@@ -120,9 +123,11 @@ static esp_err_t install_speaker(void) {
     if (err != ESP_OK) { ESP_LOGE(TAG, "spk new_channel: %s", esp_err_to_name(err)); return err; }
 
     i2s_std_config_t std = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(APP_VOICE_SAMPLE_RATE),
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                       I2S_SLOT_MODE_MONO),
+                                                       channels == 2
+                                                           ? I2S_SLOT_MODE_STEREO
+                                                           : I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = APP_SPK_BCLK_PIN,
@@ -131,6 +136,7 @@ static esp_err_t install_speaker(void) {
             .din  = I2S_GPIO_UNUSED,
         },
     };
+    if (channels == 1) std.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     err = i2s_channel_init_std_mode(s_spk_chan, &std);
     if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
         ESP_LOGE(TAG, "spk init_std: %s", esp_err_to_name(err)); return err; }
@@ -216,7 +222,8 @@ static void do_playback(void) {
     s_spk_underrun = 0;
     __sync_synchronize();
     s_phase = AUDIO_PHASE_PLAY;
-    ESP_LOGI(TAG, "PLAY start");
+    ESP_LOGI(TAG, "PLAY start rate=%u channels=%u",
+             (unsigned)s_spk_sample_rate, (unsigned)s_spk_channels);
 
     int64_t last_data_ms = now_ms();
     size_t  total_bytes = 0;
@@ -375,11 +382,20 @@ void audio_io_abort(uint32_t timeout_ms) {
     wait_phase(AUDIO_PHASE_IDLE, timeout_ms);
 }
 
-void audio_io_clear_speaker_ring(void) {
-    if (s_phase == AUDIO_PHASE_IDLE && s_req_start == REQ_NONE) {
-        ring_reset(&s_ring);
-        s_ring_role = RING_ROLE_SPK;
+esp_err_t audio_io_prepare_speaker(uint32_t sample_rate, uint8_t channels) {
+    if (sample_rate < 8000 || sample_rate > 96000 ||
+        (channels != 1 && channels != 2)) {
+        return ESP_ERR_INVALID_ARG;
     }
+    if (s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_spk_sample_rate = sample_rate;
+    s_spk_channels = channels;
+    ring_reset(&s_ring);
+    s_ring_role = RING_ROLE_SPK;
+    __sync_synchronize();
+    return ESP_OK;
 }
 
 size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms) {

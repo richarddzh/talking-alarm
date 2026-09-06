@@ -17,11 +17,15 @@ idf_component_register(
         "doubao_agent_client.c"
         "doubao_tts_player.c"
         "ui_screen.c"
+        "ui_cat_avatar.c"
         "gui_shell.c"
         "app_chat_alarm.c"
         "app_settings.c"
+        "app_radio.c"
         "app_tetris.c"
         "app_snake.c"
+        "radio_stations.c"
+        "radio_player.c"
         "st7789.c"
         "font5x7.c"
         "font_zh16.c"
@@ -43,4 +47,5 @@ idf_component_register(
         mbedtls
         nvs_flash
         spiffs
+        esp_audio_codec
 )
