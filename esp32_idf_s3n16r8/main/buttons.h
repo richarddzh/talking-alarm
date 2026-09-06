@@ -1,27 +1,22 @@
 #pragma once
+
 #include <stdbool.h>
 
 typedef enum {
-    APP_BTN_MAIN = 0,
-    APP_BTN_B,
-    APP_BTN_X,
-    APP_BTN_Y,
-    APP_BTN_COUNT,
-} app_btn_id_t;
-
-typedef struct {
-    app_btn_id_t button;
-    bool pressed;
-} app_btn_event_t;
+    APP_INPUT_MAIN_PRESSED = 0,
+    APP_INPUT_MAIN_RELEASED,
+    APP_INPUT_JOYSTICK_PRESSED,
+    APP_INPUT_LEFT,
+    APP_INPUT_RIGHT,
+    APP_INPUT_UP,
+    APP_INPUT_DOWN,
+} app_input_event_t;
 
 void buttons_init(void);
 
-// Poll once. If a debounced state change happened, fills `ev` and
-// returns true; otherwise returns false.
-bool buttons_poll(app_btn_event_t *ev);
+// Emits debounced digital-button edges and rate-limited analog-axis
+// direction events. Axis movement never emits a pressed event.
+bool buttons_poll(app_input_event_t *event);
 
-// Compatibility helper for the GPIO4 gesture button.
 bool buttons_pressed(void);
-
-bool buttons_is_pressed(app_btn_id_t button);
-const char *buttons_name(app_btn_id_t button);
+const char *buttons_event_name(app_input_event_t event);

@@ -37,11 +37,21 @@ static gui_action_t activate(uint8_t item) {
     }
 }
 
+static const gui_focus_node_t s_focus_grid[] = {
+    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
+     .up = GUI_FOCUS_HOME, .down = 1},
+    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
+     .up = 0, .down = 2},
+    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
+     .up = 1, .down = GUI_FOCUS_HOME},
+};
+
 static const gui_app_t s_app = {
     .id = "settings",
     .label = "设置",
     .icon = GUI_ICON_SETTINGS,
     .focus_count = 3,
+    .focus_grid = s_focus_grid,
     .enter = NULL,
     .exit = NULL,
     .tick = NULL,

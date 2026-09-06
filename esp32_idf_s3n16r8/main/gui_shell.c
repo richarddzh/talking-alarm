@@ -13,13 +13,8 @@
 static const gui_app_t *s_apps[MAX_GUI_APPS];
 static size_t s_app_count;
 static size_t s_current_app;
-static int s_focus;
+static int s_focus = GUI_FOCUS_HOME;
 static bool s_launcher;
-
-static int focus_count(void) {
-    if (s_launcher) return (int)s_app_count;
-    return s_apps[s_current_app]->focus_count;
-}
 
 static void draw_centered_text(int center_x, int y, const char *text,
                                uint8_t size, ui_color_t color) {
@@ -36,30 +31,47 @@ static void draw_home_icon(int x, int y, ui_color_t color) {
 
 static void draw_wifi_icon(int x, int y, bool connected) {
     ui_color_t color = connected ? UI_COLOR_SUCCESS : UI_COLOR_DANGER;
-    ui_fill_rect(x, y + 14, 4, 4, color);
-    ui_draw_line(x + 2, y + 11, x + 7, y + 6, color);
-    ui_draw_line(x + 2, y + 11, x - 3, y + 6, color);
-    ui_draw_line(x + 2, y + 6, x + 11, y - 3, color);
-    ui_draw_line(x + 2, y + 6, x - 7, y - 3, color);
+    const int cx = x + 10;
+    const int cy = y + 19;
+    const int radii[] = {6, 11, 16};
+    for (size_t r = 0; r < sizeof(radii) / sizeof(radii[0]); ++r) {
+        int radius = radii[r];
+        int inner = radius - 2;
+        for (int dy = -radius; dy <= 0; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                int dist = dx * dx + dy * dy;
+                if (dist <= radius * radius && dist >= inner * inner &&
+                    (dx < 0 ? -dx : dx) <= -dy) {
+                    ui_set_pixel(cx + dx, cy + dy, color);
+                }
+            }
+        }
+    }
+    if (connected) {
+        ui_fill_circle(cx, cy, 2, color);
+    } else {
+        ui_draw_line(cx, cy - 12, cx, cy - 6, color);
+        ui_fill_circle(cx, cy - 3, 1, color);
+    }
 }
 
 static void draw_status_bar(const gui_model_t *model) {
     ui_fill_rect(0, STATUS_Y, APP_UI_W, STATUS_H, UI_COLOR_NAVY);
     ui_fill_rect(0, STATUS_Y, APP_UI_W, 2, UI_COLOR_PRIMARY);
 
-    if (s_focus == 0) {
+    if (s_focus == GUI_FOCUS_HOME) {
         ui_draw_rect(4, STATUS_Y + 4, 76, 24, 2, UI_COLOR_FOCUS);
     }
     draw_home_icon(10, STATUS_Y + 7,
-                   s_focus == 0 ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
+                   s_focus == GUI_FOCUS_HOME ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     ui_draw_text(36, STATUS_Y + 8, "首页", 2,
-                 s_focus == 0 ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
+                 s_focus == GUI_FOCUS_HOME ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
 
     const char *time = model->time_valid ? model->time : "--:--";
     char hhmm[6] = "--:--";
     if (time && strlen(time) >= 5) memcpy(hhmm, time, 5);
     ui_draw_text(224, STATUS_Y + 9, hhmm, 2, UI_COLOR_TEXT);
-    draw_wifi_icon(298, STATUS_Y + 7,
+    draw_wifi_icon(294, STATUS_Y + 5,
                    model->wifi_connected || model->setup_mode);
 }
 
@@ -114,22 +126,22 @@ static void render_launcher(void) {
     ui_draw_text(18, 50, "请选择一个应用", 2, UI_COLOR_MUTED);
 
     const int card_w = 94;
-    const int card_h = 72;
+    const int card_h = 68;
     const int gap = 9;
     for (size_t i = 0; i < s_app_count; ++i) {
         int column = (int)(i % 3);
         int row = (int)(i / 3);
         int x = 9 + column * (card_w + gap);
-        int y = 56 + row * (card_h + 8);
+        int y = 56 + row * (card_h + 4);
         if (y + card_h > CONTENT_BOTTOM) break;
-        bool selected = s_focus == (int)i + 1;
+        bool selected = s_focus == (int)i;
         ui_fill_rect(x, y, card_w, card_h,
                      selected ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL);
         ui_draw_rect(x, y, card_w, card_h, selected ? 4 : 2,
                      selected ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
         draw_icon(s_apps[i]->icon, x + 23, y + 4,
                   selected ? UI_COLOR_FOCUS : UI_COLOR_CYAN);
-        draw_centered_text(x + card_w / 2, y + 54, s_apps[i]->label,
+        draw_centered_text(x + card_w / 2, y + 50, s_apps[i]->label,
                            2, selected ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     }
 }
@@ -140,7 +152,8 @@ void gui_shell_init(const gui_app_t *const *apps, size_t app_count,
     for (size_t i = 0; i < app_count; ++i) s_apps[i] = apps[i];
     s_app_count = app_count;
     s_current_app = default_app < app_count ? default_app : 0;
-    s_focus = app_count > 0 && s_apps[s_current_app]->focus_count > 0 ? 1 : 0;
+    s_focus = app_count > 0 && s_apps[s_current_app]->focus_count > 0
+                  ? 0 : GUI_FOCUS_HOME;
     s_launcher = false;
     if (s_app_count > 0 && s_apps[s_current_app]->enter) {
         s_apps[s_current_app]->enter();
@@ -153,35 +166,70 @@ gui_action_t gui_shell_handle_input(gui_input_t input) {
         if (s_apps[s_current_app]->handle_input(input, &action)) return action;
     }
 
-    int count = focus_count();
-    if (input == GUI_INPUT_PREVIOUS || input == GUI_INPUT_LEFT ||
-        input == GUI_INPUT_UP) {
-        s_focus = s_focus <= 0 ? count : s_focus - 1;
+    if (input == GUI_INPUT_PREVIOUS) input = GUI_INPUT_LEFT;
+    if (input == GUI_INPUT_NEXT) input = GUI_INPUT_RIGHT;
+
+    if (input == GUI_INPUT_LEFT || input == GUI_INPUT_RIGHT ||
+        input == GUI_INPUT_UP || input == GUI_INPUT_DOWN) {
+        if (s_focus == GUI_FOCUS_HOME) {
+            if (s_launcher) {
+                s_focus = s_app_count > 0 ? 0 : GUI_FOCUS_HOME;
+            } else {
+                s_focus = s_apps[s_current_app]->focus_count > 0
+                              ? 0 : GUI_FOCUS_HOME;
+            }
+            return GUI_ACTION_NONE;
+        }
+
+        if (s_launcher) {
+            int column = s_focus % 3;
+            int row = s_focus / 3;
+            int target = s_focus;
+            if (input == GUI_INPUT_LEFT) target = s_focus - 1;
+            if (input == GUI_INPUT_RIGHT) target = s_focus + 1;
+            if (input == GUI_INPUT_UP) target = s_focus - 3;
+            if (input == GUI_INPUT_DOWN) target = s_focus + 3;
+            bool invalid =
+                target < 0 || target >= (int)s_app_count ||
+                (input == GUI_INPUT_LEFT && target / 3 != row) ||
+                (input == GUI_INPUT_RIGHT && target / 3 != row) ||
+                (input == GUI_INPUT_UP && column != target % 3) ||
+                (input == GUI_INPUT_DOWN && column != target % 3);
+            s_focus = invalid ? GUI_FOCUS_HOME : target;
+            return GUI_ACTION_NONE;
+        }
+
+        const gui_app_t *app = s_apps[s_current_app];
+        if (!app->focus_grid || s_focus >= app->focus_count) return GUI_ACTION_NONE;
+        const gui_focus_node_t *node = &app->focus_grid[s_focus];
+        int target = GUI_FOCUS_NONE;
+        if (input == GUI_INPUT_LEFT) target = node->left;
+        if (input == GUI_INPUT_RIGHT) target = node->right;
+        if (input == GUI_INPUT_UP) target = node->up;
+        if (input == GUI_INPUT_DOWN) target = node->down;
+        if (target != GUI_FOCUS_NONE) s_focus = target;
         return GUI_ACTION_NONE;
     }
-    if (input == GUI_INPUT_NEXT || input == GUI_INPUT_RIGHT ||
-        input == GUI_INPUT_DOWN) {
-        s_focus = s_focus >= count ? 0 : s_focus + 1;
-        return GUI_ACTION_NONE;
-    }
+    if (input == GUI_INPUT_AUX_ACTIVATE) input = GUI_INPUT_ACTIVATE;
     if (input != GUI_INPUT_ACTIVATE) return GUI_ACTION_NONE;
 
-    if (s_focus == 0) {
+    if (s_focus == GUI_FOCUS_HOME) {
         if (!s_launcher && s_apps[s_current_app]->exit) {
             s_apps[s_current_app]->exit();
         }
         s_launcher = true;
-        s_focus = s_app_count > 0 ? 1 : 0;
+        s_focus = s_app_count > 0 ? 0 : GUI_FOCUS_HOME;
         return GUI_ACTION_NONE;
     }
     if (s_launcher) {
-        s_current_app = (size_t)(s_focus - 1);
+        s_current_app = (size_t)s_focus;
         s_launcher = false;
-        s_focus = s_apps[s_current_app]->focus_count > 0 ? 1 : 0;
+        s_focus = s_apps[s_current_app]->focus_count > 0
+                      ? 0 : GUI_FOCUS_HOME;
         if (s_apps[s_current_app]->enter) s_apps[s_current_app]->enter();
         return GUI_ACTION_NONE;
     }
-    return s_apps[s_current_app]->activate((uint8_t)(s_focus - 1));
+    return s_apps[s_current_app]->activate((uint8_t)s_focus);
 }
 
 gui_action_t gui_shell_tick(int64_t now_ms) {
@@ -196,7 +244,7 @@ void gui_shell_render(const gui_model_t *model) {
     if (s_launcher) {
         render_launcher();
     } else {
-        s_apps[s_current_app]->render(model, s_focus - 1);
+        s_apps[s_current_app]->render(model, s_focus);
     }
     draw_status_bar(model);
     ESP_ERROR_CHECK_WITHOUT_ABORT(ui_flush());

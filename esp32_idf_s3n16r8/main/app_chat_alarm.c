@@ -7,7 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <string.h>
 
-#define CHAT_HISTORY_CAPACITY 6
+#define CHAT_HISTORY_CAPACITY 10
 #define CHAT_TEXT_BYTES 192
 #define CHAT_VISIBLE_MESSAGES 3
 
@@ -36,6 +36,7 @@ static void copy_utf8(char *dst, size_t capacity, const char *src) {
 }
 
 static void append_message_locked(bool from_user, const char *text) {
+    if (!text || !text[0]) return;
     if (s_history_count == CHAT_HISTORY_CAPACITY) {
         memmove(&s_history[0], &s_history[1],
                 sizeof(s_history[0]) * (CHAT_HISTORY_CAPACITY - 1));
@@ -46,14 +47,24 @@ static void append_message_locked(bool from_user, const char *text) {
     copy_utf8(message->text, sizeof(message->text), text);
 }
 
+void app_chat_alarm_append_user(const char *text) {
+    taskENTER_CRITICAL(&s_history_lock);
+    append_message_locked(true, text);
+    taskEXIT_CRITICAL(&s_history_lock);
+}
+
+void app_chat_alarm_append_assistant(const char *text) {
+    taskENTER_CRITICAL(&s_history_lock);
+    append_message_locked(false, text);
+    taskEXIT_CRITICAL(&s_history_lock);
+}
+
 static void turn_received(const char *user_text,
                           const char *assistant_text,
                           void *ctx) {
     (void)ctx;
-    taskENTER_CRITICAL(&s_history_lock);
-    append_message_locked(true, user_text);
-    append_message_locked(false, assistant_text);
-    taskEXIT_CRITICAL(&s_history_lock);
+    app_chat_alarm_append_user(user_text);
+    app_chat_alarm_append_assistant(assistant_text);
 }
 
 static void enter(void) {
@@ -109,7 +120,7 @@ static int utf8_char_bytes(const char *text) {
     return 1;
 }
 
-static void wrap_text(const char *text,
+static void wrap_text(const char *text, int max_width,
                       char line1[CHAT_TEXT_BYTES],
                       char line2[CHAT_TEXT_BYTES]) {
     char *lines[2] = {line1, line2};
@@ -122,7 +133,7 @@ static void wrap_text(const char *text,
     while (*text && line < 2) {
         int bytes = utf8_char_bytes(text);
         int width = ((uint8_t)text[0] < 0x80) ? 12 : 16;
-        if (widths[line] + width > 206) {
+        if (widths[line] + width > max_width) {
             ++line;
             continue;
         }
@@ -138,26 +149,45 @@ static void wrap_text(const char *text,
     }
 }
 
+static void draw_cat_avatar(int x, int y, bool from_user) {
+    ui_color_t bg = from_user ? UI_COLOR_PRIMARY : UI_COLOR_WARNING;
+    ui_fill_round_rect(x, y, 30, 30, 7, bg);
+    ui_fill_triangle(x + 5, y + 8, x + 8, y + 1, x + 13, y + 8, bg);
+    ui_fill_triangle(x + 17, y + 8, x + 22, y + 1, x + 25, y + 8, bg);
+    ui_fill_circle(x + 11, y + 14, 3, UI_COLOR_WHITE);
+    ui_fill_circle(x + 20, y + 14, 3, UI_COLOR_WHITE);
+    ui_fill_circle(x + 12, y + 14, 1, UI_COLOR_BLACK);
+    ui_fill_circle(x + 19, y + 14, 1, UI_COLOR_BLACK);
+    ui_fill_triangle(x + 14, y + 19, x + 17, y + 19,
+                     x + 15, y + 21, UI_COLOR_DANGER);
+    ui_draw_line(x + 15, y + 22, x + 11, y + 24, UI_COLOR_BLACK);
+    ui_draw_line(x + 16, y + 22, x + 20, y + 24, UI_COLOR_BLACK);
+}
+
 static void draw_bubble(int y, const chat_message_t *message) {
-    const int width = 230;
-    const int height = 38;
-    int x = message->from_user ? APP_UI_W - width - 12 : 12;
+    const int width = 238;
+    const int height = 40;
+    const int avatar_x = message->from_user ? 284 : 6;
+    int x = message->from_user ? 38 : 44;
     ui_color_t background =
         message->from_user ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL;
     ui_color_t border =
         message->from_user ? UI_COLOR_PRIMARY : UI_COLOR_PANEL_ALT;
 
-    ui_fill_rect(x, y, width, height, background);
-    ui_draw_rect(x, y, width, height, 1, border);
+    draw_cat_avatar(avatar_x, y + 5, message->from_user);
+    ui_fill_round_rect(x, y, width, height, 8, background);
     if (message->from_user) {
-        ui_fill_rect(x + width, y + 23, 6, 8, background);
+        ui_fill_triangle(x + width - 2, y + 21, x + width + 9, y + 27,
+                         x + width - 2, y + 32, background);
     } else {
-        ui_fill_rect(x - 6, y + 23, 6, 8, background);
+        ui_fill_triangle(x + 2, y + 21, x - 9, y + 27,
+                         x + 2, y + 32, background);
     }
+    ui_draw_line(x + 8, y, x + width - 9, y, border);
 
     char line1[CHAT_TEXT_BYTES];
     char line2[CHAT_TEXT_BYTES];
-    wrap_text(message->text, line1, line2);
+    wrap_text(message->text, width - 16, line1, line2);
     ui_draw_text(x + 8, y + 3, line1, 2, UI_COLOR_TEXT);
     ui_draw_text(x + 8, y + 20, line2, 2, UI_COLOR_TEXT);
 }
@@ -182,13 +212,13 @@ static void render_chat(const gui_model_t *model, int focused_item) {
             .from_user = false,
             .text = "你好，按住主按钮和我聊天。",
         };
-        draw_bubble(48, &greeting);
+        draw_bubble(45, &greeting);
     } else {
         size_t visible = count < CHAT_VISIBLE_MESSAGES
                              ? count : CHAT_VISIBLE_MESSAGES;
         size_t first = count - visible;
         for (size_t i = 0; i < visible; ++i) {
-            draw_bubble(38 + (int)i * 43, &snapshot[first + i]);
+            draw_bubble(36 + (int)i * 45, &snapshot[first + i]);
         }
     }
 
@@ -228,11 +258,21 @@ static bool handle_input(gui_input_t input, gui_action_t *action) {
     return false;
 }
 
+static const gui_focus_node_t s_focus_grid[] = {
+    {
+        .left = GUI_FOCUS_NONE,
+        .right = GUI_FOCUS_NONE,
+        .up = GUI_FOCUS_HOME,
+        .down = GUI_FOCUS_HOME,
+    },
+};
+
 static const gui_app_t s_app = {
     .id = "chat_alarm",
     .label = "闲聊闹钟",
     .icon = GUI_ICON_CHAT,
     .focus_count = 1,
+    .focus_grid = s_focus_grid,
     .enter = enter,
     .exit = exit_app,
     .tick = tick,

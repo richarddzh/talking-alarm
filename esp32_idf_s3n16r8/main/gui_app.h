@@ -19,12 +19,14 @@ typedef enum {
     GUI_INPUT_LEFT,
     GUI_INPUT_RIGHT,
     GUI_INPUT_ACTIVATE,
+    GUI_INPUT_AUX_ACTIVATE,
     GUI_INPUT_LONG_PRESS,
     GUI_INPUT_RELEASE,
 } gui_input_t;
 
 typedef enum {
     GUI_ACTION_NONE = 0,
+    GUI_ACTION_REDRAW,
     GUI_ACTION_CHIME,
     GUI_ACTION_TOGGLE_QUIET,
     GUI_ACTION_TOGGLE_SETUP,
@@ -32,6 +34,16 @@ typedef enum {
     GUI_ACTION_START_VOICE,
     GUI_ACTION_STOP_VOICE,
 } gui_action_t;
+
+#define GUI_FOCUS_HOME (-1)
+#define GUI_FOCUS_NONE (-2)
+
+typedef struct {
+    int8_t left;
+    int8_t right;
+    int8_t up;
+    int8_t down;
+} gui_focus_node_t;
 
 typedef struct {
     const char *date;
@@ -54,6 +66,7 @@ typedef struct {
     const char *label;
     gui_icon_t icon;
     uint8_t focus_count;
+    const gui_focus_node_t *focus_grid;
     void (*enter)(void);
     void (*exit)(void);
     gui_action_t (*tick)(int64_t now_ms);

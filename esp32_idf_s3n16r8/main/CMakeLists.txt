@@ -20,6 +20,8 @@ idf_component_register(
         "gui_shell.c"
         "app_chat_alarm.c"
         "app_settings.c"
+        "app_tetris.c"
+        "app_snake.c"
         "st7789.c"
         "font5x7.c"
         "font_zh16.c"
@@ -29,6 +31,7 @@ idf_component_register(
         "assets/unifont_bmp16.bin"
     REQUIRES
         driver
+        esp_adc
         esp_driver_rmt
         esp_timer
         esp_wifi

@@ -6,3 +6,4 @@ __pycache__/
 !esp32_idf_s3n16r8/main/assets/unifont_bmp16.bin
 *.zip
 esp32_idf_s3n16r8/build/
+esp32_idf_s3n16r8/build-*/

@@ -14,6 +14,8 @@
 
 static const char *TAG = "ui";
 static uint8_t *s_framebuffer;
+static uint8_t *s_previous_framebuffer;
+static bool s_previous_valid;
 static const uint16_t s_palette[16] = {
     [UI_COLOR_BLACK] = 0x0000,
     [UI_COLOR_WHITE] = 0xFFFF,
@@ -73,6 +75,74 @@ void ui_draw_rect(int x, int y, int width, int height,
     ui_fill_rect(x, y + height - thickness, width, thickness, color);
     ui_fill_rect(x, y, thickness, height, color);
     ui_fill_rect(x + width - thickness, y, thickness, height, color);
+}
+
+void ui_fill_circle(int center_x, int center_y, int radius, ui_color_t color) {
+    int radius_sq = radius * radius;
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radius_sq) {
+                ui_set_pixel(center_x + x, center_y + y, color);
+            }
+        }
+    }
+}
+
+void ui_fill_round_rect(int x, int y, int width, int height,
+                        int radius, ui_color_t color) {
+    if (radius < 1) {
+        ui_fill_rect(x, y, width, height, color);
+        return;
+    }
+    if (radius * 2 > width) radius = width / 2;
+    if (radius * 2 > height) radius = height / 2;
+    ui_fill_rect(x + radius, y, width - radius * 2, height, color);
+    ui_fill_rect(x, y + radius, width, height - radius * 2, color);
+    ui_fill_circle(x + radius, y + radius, radius, color);
+    ui_fill_circle(x + width - radius - 1, y + radius, radius, color);
+    ui_fill_circle(x + radius, y + height - radius - 1, radius, color);
+    ui_fill_circle(x + width - radius - 1, y + height - radius - 1,
+                   radius, color);
+}
+
+void ui_draw_round_rect(int x, int y, int width, int height,
+                        int radius, int thickness, ui_color_t color) {
+    if (thickness < 1) thickness = 1;
+    ui_fill_round_rect(x, y, width, height, radius, color);
+    if (width > thickness * 2 && height > thickness * 2) {
+        ui_fill_round_rect(x + thickness, y + thickness,
+                           width - thickness * 2, height - thickness * 2,
+                           radius > thickness ? radius - thickness : 1,
+                           UI_COLOR_BG);
+    }
+}
+
+static int edge_value(int ax, int ay, int bx, int by, int px, int py) {
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+void ui_fill_triangle(int x0, int y0, int x1, int y1,
+                      int x2, int y2, ui_color_t color) {
+    int min_x = x0 < x1 ? x0 : x1;
+    if (x2 < min_x) min_x = x2;
+    int max_x = x0 > x1 ? x0 : x1;
+    if (x2 > max_x) max_x = x2;
+    int min_y = y0 < y1 ? y0 : y1;
+    if (y2 < min_y) min_y = y2;
+    int max_y = y0 > y1 ? y0 : y1;
+    if (y2 > max_y) max_y = y2;
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            int e0 = edge_value(x0, y0, x1, y1, x, y);
+            int e1 = edge_value(x1, y1, x2, y2, x, y);
+            int e2 = edge_value(x2, y2, x0, y0, x, y);
+            if ((e0 >= 0 && e1 >= 0 && e2 >= 0) ||
+                (e0 <= 0 && e1 <= 0 && e2 <= 0)) {
+                ui_set_pixel(x, y, color);
+            }
+        }
+    }
 }
 
 void ui_draw_line(int x0, int y0, int x1, int y1, ui_color_t color) {
@@ -197,7 +267,60 @@ int ui_text_width(const char *text, uint8_t size) {
 }
 
 esp_err_t ui_flush(void) {
-    return st7789_show_indexed4(s_framebuffer, APP_UI_W, APP_UI_H, s_palette);
+    const int row_bytes = APP_UI_W / 2;
+    if (!s_previous_valid) {
+        esp_err_t err = st7789_show_indexed4(
+            s_framebuffer, APP_UI_W, APP_UI_H, s_palette);
+        if (err == ESP_OK) {
+            memcpy(s_previous_framebuffer, s_framebuffer, FRAMEBUFFER_BYTES);
+            s_previous_valid = true;
+        }
+        return err;
+    }
+
+    int16_t first_changed[APP_UI_H];
+    int16_t last_changed[APP_UI_H];
+    size_t dirty_bytes = 0;
+    for (int y = 0; y < APP_UI_H; ++y) {
+        const uint8_t *current = s_framebuffer + y * row_bytes;
+        const uint8_t *previous = s_previous_framebuffer + y * row_bytes;
+        int first = 0;
+        while (first < row_bytes && current[first] == previous[first]) ++first;
+        if (first == row_bytes) {
+            first_changed[y] = -1;
+            last_changed[y] = -1;
+            continue;
+        }
+        int last = row_bytes - 1;
+        while (last > first && current[last] == previous[last]) --last;
+        first_changed[y] = (int16_t)first;
+        last_changed[y] = (int16_t)last;
+        dirty_bytes += (size_t)(last - first + 1);
+    }
+
+    if (dirty_bytes == 0) return ESP_OK;
+    if (dirty_bytes > FRAMEBUFFER_BYTES / 3) {
+        esp_err_t err = st7789_show_indexed4(
+            s_framebuffer, APP_UI_W, APP_UI_H, s_palette);
+        if (err == ESP_OK) {
+            memcpy(s_previous_framebuffer, s_framebuffer, FRAMEBUFFER_BYTES);
+        }
+        return err;
+    }
+
+    for (int y = 0; y < APP_UI_H; ++y) {
+        if (first_changed[y] < 0) continue;
+        int first = first_changed[y];
+        int last = last_changed[y];
+        esp_err_t err = st7789_show_indexed4_region(
+            s_framebuffer, APP_UI_W, first * 2, y,
+            (last - first + 1) * 2, 1, s_palette);
+        if (err != ESP_OK) return err;
+        memcpy(s_previous_framebuffer + y * row_bytes + first,
+               s_framebuffer + y * row_bytes + first,
+               (size_t)(last - first + 1));
+    }
+    return ESP_OK;
 }
 
 esp_err_t ui_init(void) {
@@ -208,6 +331,15 @@ esp_err_t ui_init(void) {
                  (unsigned)FRAMEBUFFER_BYTES);
         return ESP_ERR_NO_MEM;
     }
+    s_previous_framebuffer = heap_caps_calloc(
+        1, FRAMEBUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_previous_framebuffer) {
+        heap_caps_free(s_framebuffer);
+        s_framebuffer = NULL;
+        ESP_LOGE(TAG, "cannot allocate previous UI framebuffer in PSRAM");
+        return ESP_ERR_NO_MEM;
+    }
+    s_previous_valid = false;
     esp_err_t err = st7789_init();
     if (err != ESP_OK) return err;
     ui_begin(UI_COLOR_BLACK);

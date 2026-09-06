@@ -26,3 +26,6 @@ esp_err_t  chime_player_start_text(const char *text);
 
 typedef void (*chime_player_status_cb_t)(void *ctx);
 void chime_player_set_status_cb(chime_player_status_cb_t cb, void *ctx);
+
+typedef void (*chime_player_text_cb_t)(const char *text, void *ctx);
+void chime_player_set_text_cb(chime_player_text_cb_t cb, void *ctx);

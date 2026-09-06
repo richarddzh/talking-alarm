@@ -19,6 +19,8 @@
 #include "gui_shell.h"
 #include "app_chat_alarm.h"
 #include "app_settings.h"
+#include "app_tetris.h"
+#include "app_snake.h"
 #include "wifi_creds.h"
 #include "wifi_provision.h"
 #include "wifi_time.h"
@@ -151,6 +153,11 @@ static void voice_status_changed_cb(void *ctx) {
 static void chime_status_changed_cb(void *ctx) {
     (void)ctx;
     s_chime_status_dirty = true;
+}
+
+static void chime_text_received_cb(const char *text, void *ctx) {
+    (void)ctx;
+    app_chat_alarm_append_assistant(text);
 }
 
 static void copy_time_from_rtc(const rtc_ds3231_time_t *rtc) {
@@ -372,6 +379,15 @@ static bool trigger_chime(const char *reason, const char *time_arg) {
         render_home();
         return false;
     }
+    if (time_arg && time_arg[0]) {
+        char message[48];
+        snprintf(message, sizeof(message), "定时播报 %s", time_arg);
+        app_chat_alarm_append_user(message);
+    } else if (strcmp(reason, "random chime") == 0) {
+        app_chat_alarm_append_user("随机闲聊");
+    } else {
+        app_chat_alarm_append_user("请和我闲聊一下");
+    }
     return true;
 }
 
@@ -451,6 +467,9 @@ static void toggle_quiet_mode(void) {
 
 static void dispatch_gui_action(gui_action_t action) {
     switch (action) {
+    case GUI_ACTION_REDRAW:
+        render_home();
+        break;
     case GUI_ACTION_CHIME:
         trigger_chime("app chat", NULL);
         break;
@@ -494,31 +513,29 @@ static void dispatch_gui_action(gui_action_t action) {
     }
 }
 
-static void handle_button_event(const app_btn_event_t *e) {
-    if (e->button != APP_BTN_MAIN) {
-        if (!e->pressed) return;
-        gui_input_t input;
-        switch (e->button) {
-        case APP_BTN_B:
-            input = GUI_INPUT_NEXT;
-            break;
-        case APP_BTN_X:
-            input = GUI_INPUT_PREVIOUS;
-            break;
-        case APP_BTN_Y:
-            input = GUI_INPUT_ACTIVATE;
-            break;
-        default:
-            return;
-        }
-        dispatch_gui_action(gui_shell_handle_input(input));
+static void handle_input_event(app_input_event_t event) {
+    switch (event) {
+    case APP_INPUT_LEFT:
+        dispatch_gui_action(gui_shell_handle_input(GUI_INPUT_LEFT));
         return;
-    }
-
-    if (e->pressed) {
+    case APP_INPUT_RIGHT:
+        dispatch_gui_action(gui_shell_handle_input(GUI_INPUT_RIGHT));
+        return;
+    case APP_INPUT_UP:
+        dispatch_gui_action(gui_shell_handle_input(GUI_INPUT_UP));
+        return;
+    case APP_INPUT_DOWN:
+        dispatch_gui_action(gui_shell_handle_input(GUI_INPUT_DOWN));
+        return;
+    case APP_INPUT_JOYSTICK_PRESSED:
+        dispatch_gui_action(gui_shell_handle_input(GUI_INPUT_AUX_ACTIVATE));
+        return;
+    case APP_INPUT_MAIN_PRESSED:
         s_button_press_ms = now_ms();
         s_button_long_handled = false;
         return;
+    case APP_INPUT_MAIN_RELEASED:
+        break;
     }
 
     if (s_button_press_ms == 0) return;
@@ -606,10 +623,13 @@ static void initialise(void) {
     ESP_ERROR_CHECK(chime_player_init());
     voice_chat_set_status_cb(voice_status_changed_cb, NULL);
     chime_player_set_status_cb(chime_status_changed_cb, NULL);
+    chime_player_set_text_cb(chime_text_received_cb, NULL);
 
     const gui_app_t *apps[] = {
         app_chat_alarm_descriptor(),
         app_settings_descriptor(),
+        app_tetris_descriptor(),
+        app_snake_descriptor(),
     };
     gui_shell_init(apps, sizeof(apps) / sizeof(apps[0]), 0);
 
@@ -632,13 +652,12 @@ void app_main(void) {
     initialise();
 
     for (;;) {
-        app_btn_event_t ev;
+        app_input_event_t ev;
         if (buttons_poll(&ev)) {
-            snprintf(s_btn_msg, sizeof(s_btn_msg), "%s %s",
-                     buttons_name(ev.button),
-                     ev.pressed ? "pressed" : "released");
+            snprintf(s_btn_msg, sizeof(s_btn_msg), "%s",
+                     buttons_event_name(ev));
             ESP_LOGI(TAG, "%s", s_btn_msg);
-            handle_button_event(&ev);
+            handle_input_event(ev);
             render_home();
         }
         handle_button_long_press();

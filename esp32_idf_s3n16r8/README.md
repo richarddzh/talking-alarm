@@ -206,16 +206,18 @@ ESP32 直接调用豆包 ASR、Agent 和 TTS。API key 不再通过编译期 `ma
 
 | 用途                       | 引脚           |
 |----------------------------|----------------|
-| 单按钮（低电平有效）       | GPIO 4         |
-| 摇杆按钮 B / X / Y（低电平有效） | GPIO 19/20/21 |
+| 独立主确认按钮（低电平有效） | GPIO 4 |
+| 摇杆 B 辅助确认（低电平有效） | GPIO 21 |
+| 摇杆 X / Y 模拟轴 | GPIO 19 / 20（ADC） |
 | DS3231 I2C SDA / SCL       | GPIO 8/9       |
 | ST7789 SCL / SDA / DC / CS | GPIO 11/12/13/14 |
 | 麦克风 BCLK / LRCK / SD    | GPIO 2/1/42    |
 | 扬声器 BCLK / LRC / DIN    | GPIO 41/40/39  |
 | 板载 RGB LED               | GPIO 48（启动时关闭） |
 
-GPIO39–42 同时是默认 JTAG 信号脚；当前固件将其复用为 I2S，因此需要调试时
-请使用板载 USB Serial/JTAG，而不要连接外部 JTAG 到这些引脚。
+GPIO19/20 用作摇杆 ADC，原生 USB Serial/JTAG 次级控制台已关闭；日志使用
+默认 UART 控制台。GPIO39–42 同时是默认 JTAG 信号脚，当前固件将其复用为
+I2S，因此也不要连接外部 JTAG 到这些引脚。
 
 ST7789 按 320×240 横屏初始化，SPI 时钟为 40 MHz。模块的 GND、VCC 和
 背光脚需要按模块规格另外接线；当前接线未提供硬件 RESET，驱动使用软件
@@ -247,8 +249,12 @@ Agent 生成报时或随机发言文本，再直连豆包 TTS 播放。
 
 GUI 操作：
 
-- B / X：移动到下一项 / 上一项。
-- Y 或主按钮短按：确认当前焦点。
+- X 模拟轴：横向移动焦点。
+- Y 模拟轴：纵向移动焦点。
+- 独立主按钮短按：确认当前焦点。
+- 摇杆 B：默认作为可重映射的辅助确认键。
+- X/Y 方向事件与确认事件在输入适配层分离，不会触发按钮按下动作。
+- 只有闲聊闹钟 App 的动作卡会把确认映射为 Chime；其它 App 执行各自操作。
 - 闲聊闹钟 App 内按住主按钮 800 ms：开始麦克风录音，松开后执行 ASR → Agent → TTS 并播放回复；最长录音 10 秒。
 - 配置模式按住 800 ms：关闭临时热点并尝试连接已保存的 Wi-Fi；连接失败会自动回到配置模式。
 - 正常联网时不能通过按钮主动打开配置热点；无凭据或连接失败时固件会自动进入配置模式。
@@ -336,7 +342,7 @@ esp32_wifi_alarm_idf/
     ├── app_secret_store.[ch] SPIFFS /app_secrets.txt 读写
     ├── wifi_time.[ch]      esp_wifi STA + esp_http_client 取时
     ├── wifi_provision.[ch] SoftAP + HTTP 配网页
-    ├── buttons.[ch]        主按钮和 B/X/Y 输入 + 软件去抖
+    ├── buttons.[ch]        双确认按钮去抖 + X/Y ADC 摇杆方向
     ├── gui_app.h           App 描述符、输入和动作接口
     ├── gui_shell.[ch]      主导航、焦点路由和底部状态栏
     ├── app_chat_alarm.[ch] 闲聊闹钟 App

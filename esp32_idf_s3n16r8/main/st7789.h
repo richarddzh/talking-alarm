@@ -10,3 +10,8 @@ esp_err_t st7789_init(void);
 esp_err_t st7789_show_indexed4(const uint8_t *framebuffer,
                                int width, int height,
                                const uint16_t palette[16]);
+
+esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
+                                      int framebuffer_width,
+                                      int x, int y, int width, int height,
+                                      const uint16_t palette[16]);

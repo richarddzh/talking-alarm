@@ -112,19 +112,36 @@ esp_err_t st7789_show_indexed4(const uint8_t *framebuffer,
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = set_window(0, 0, APP_TFT_W, APP_TFT_H);
+    return st7789_show_indexed4_region(framebuffer, width, 0, 0,
+                                       width, height, palette);
+}
+
+esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
+                                      int framebuffer_width,
+                                      int x, int y, int width, int height,
+                                      const uint16_t palette[16]) {
+    if (!framebuffer || !palette || framebuffer_width != APP_TFT_W ||
+        x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x + width > APP_TFT_W || y + height > APP_TFT_H) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = set_window(x, y, width, height);
     if (err != ESP_OK) return err;
 
-    for (int y = 0; y < APP_TFT_H; ++y) {
-        const uint8_t *source = framebuffer + y * (APP_TFT_W / 2);
-        for (int x = 0; x < APP_TFT_W; ++x) {
-            uint8_t packed = source[x >> 1];
-            uint8_t index = (x & 1) ? (packed & 0x0F) : (packed >> 4);
+    for (int row = y; row < y + height; ++row) {
+        const uint8_t *source =
+            framebuffer + row * (framebuffer_width / 2);
+        for (int column = 0; column < width; ++column) {
+            int source_x = x + column;
+            uint8_t packed = source[source_x >> 1];
+            uint8_t index =
+                (source_x & 1) ? (packed & 0x0F) : (packed >> 4);
             uint16_t color = palette[index];
-            s_line[x * 2] = color >> 8;
-            s_line[x * 2 + 1] = color;
+            s_line[column * 2] = color >> 8;
+            s_line[column * 2 + 1] = color;
         }
-        err = transmit(true, s_line, sizeof(s_line));
+        err = transmit(true, s_line, (size_t)width * 2);
         if (err != ESP_OK) return err;
     }
     return ESP_OK;

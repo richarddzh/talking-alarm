@@ -22,6 +22,8 @@ static char s_fixed_text[256];
 static bool s_text_only;
 static chime_player_status_cb_t s_status_cb;
 static void *s_status_ctx;
+static chime_player_text_cb_t s_text_cb;
+static void *s_text_ctx;
 
 static void set_status(chime_status_t st, const char *msg) {
     s_status = st;
@@ -76,6 +78,7 @@ static void chime_worker(void *arg) {
         }
 
         ESP_LOGI(TAG, "chime text %u bytes: %s", (unsigned)strlen(text), text);
+        if (s_text_cb) s_text_cb(text, s_text_ctx);
         set_status(CHIME_WAITING_REPLY, "tts chime");
         err = doubao_tts_play_text(text, chime_tts_status, NULL);
         free(text);
@@ -147,4 +150,9 @@ esp_err_t chime_player_start_text(const char *text) {
 void chime_player_set_status_cb(chime_player_status_cb_t cb, void *ctx) {
     s_status_cb = cb;
     s_status_ctx = ctx;
+}
+
+void chime_player_set_text_cb(chime_player_text_cb_t cb, void *ctx) {
+    s_text_cb = cb;
+    s_text_ctx = ctx;
 }

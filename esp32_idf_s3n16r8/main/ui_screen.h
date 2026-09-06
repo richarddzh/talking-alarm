@@ -28,6 +28,13 @@ void ui_set_pixel(int x, int y, ui_color_t color);
 void ui_fill_rect(int x, int y, int width, int height, ui_color_t color);
 void ui_draw_rect(int x, int y, int width, int height,
                   int thickness, ui_color_t color);
+void ui_fill_round_rect(int x, int y, int width, int height,
+                        int radius, ui_color_t color);
+void ui_draw_round_rect(int x, int y, int width, int height,
+                        int radius, int thickness, ui_color_t color);
+void ui_fill_circle(int center_x, int center_y, int radius, ui_color_t color);
+void ui_fill_triangle(int x0, int y0, int x1, int y1,
+                      int x2, int y2, ui_color_t color);
 void ui_draw_line(int x0, int y0, int x1, int y1, ui_color_t color);
 void ui_draw_text(int x, int y, const char *text,
                   uint8_t size, ui_color_t color);
