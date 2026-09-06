@@ -6,11 +6,15 @@
 
 #include <stdio.h>
 
-#define RADIO_ROW_Y 48
-#define RADIO_ROW_H 28
+#define RADIO_ROW_Y 42
+#define RADIO_ROW_H 25
+#define RADIO_VISIBLE_ROWS 4
+#define RADIO_SPECTRUM_Y 154
+#define RADIO_SPECTRUM_H 39
 
 static uint32_t s_seen_generation;
 static size_t s_selected_station;
+static gui_focus_node_t s_focus_grid[RADIO_STATION_COUNT];
 
 static const char *state_label(radio_player_state_t state) {
     switch (state) {
@@ -30,6 +34,16 @@ static void enter(void) {
     s_seen_generation = snapshot.generation;
     if (snapshot.station_index < radio_station_count()) {
         s_selected_station = snapshot.station_index;
+    }
+    for (size_t i = 0; i < radio_station_count(); ++i) {
+        s_focus_grid[i] = (gui_focus_node_t){
+            .left = GUI_FOCUS_NONE,
+            .right = GUI_FOCUS_NONE,
+            .up = i == 0 ? GUI_FOCUS_HOME : (int8_t)(i - 1),
+            .down = i + 1 == radio_station_count()
+                        ? GUI_FOCUS_HOME
+                        : (int8_t)(i + 1),
+        };
     }
 }
 
@@ -62,9 +76,17 @@ static void render(const gui_model_t *model, int focused_item) {
                            : UI_COLOR_CYAN);
     ui_draw_text(226, 13, snapshot.message, 1, UI_COLOR_MUTED);
 
-    for (size_t i = 0; i < radio_station_count(); ++i) {
+    size_t first = 0;
+    if (focused_item >= RADIO_VISIBLE_ROWS) {
+        first = (size_t)focused_item - RADIO_VISIBLE_ROWS + 1;
+    }
+    if (first + RADIO_VISIBLE_ROWS > radio_station_count()) {
+        first = radio_station_count() - RADIO_VISIBLE_ROWS;
+    }
+    for (size_t row = 0; row < RADIO_VISIBLE_ROWS; ++row) {
+        size_t i = first + row;
         const radio_station_t *station = radio_station_get(i);
-        int y = RADIO_ROW_Y + (int)i * RADIO_ROW_H;
+        int y = RADIO_ROW_Y + (int)row * RADIO_ROW_H;
         bool focused = focused_item == (int)i;
         bool active = radio_player_busy() &&
                       snapshot.station_index == i;
@@ -75,21 +97,46 @@ static void render(const gui_model_t *model, int focused_item) {
                            focused ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
         ui_fill_circle(28, y + 12, 5,
                        active ? UI_COLOR_SUCCESS : UI_COLOR_MUTED);
-        ui_draw_text(42, y + 5, station->name, 2,
+        ui_draw_text(42, y + 5, station->name, 1,
                      focused ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
-        ui_draw_text(270, y + 7, station->region, 1, UI_COLOR_MUTED);
+        ui_draw_text(274, y + 7, station->region, 1, UI_COLOR_MUTED);
     }
 
-    char format[48];
+    char volume[32];
+    snprintf(volume, sizeof(volume), "音量 %u/5  左右调节",
+             (unsigned)snapshot.volume_level);
+    ui_draw_text(16, 143, volume, 1, UI_COLOR_CYAN);
+
+    const int bar_w = 22;
+    const int gap = 5;
+    for (size_t i = 0; i < RADIO_SPECTRUM_BANDS; ++i) {
+        int height = snapshot.spectrum[i] * RADIO_SPECTRUM_H / 100;
+        if (snapshot.state == RADIO_PLAYER_PLAYING && height < 2) height = 2;
+        int x = 20 + (int)i * (bar_w + gap);
+        ui_fill_rect(x, RADIO_SPECTRUM_Y, bar_w, RADIO_SPECTRUM_H,
+                     UI_COLOR_PANEL);
+        ui_fill_rect(x, RADIO_SPECTRUM_Y + RADIO_SPECTRUM_H - height,
+                     bar_w, height,
+                     i < 3 ? UI_COLOR_SUCCESS
+                           : i < 7 ? UI_COLOR_CYAN : UI_COLOR_MAGENTA);
+    }
+
+    char format[56];
     if (snapshot.sample_rate) {
-        snprintf(format, sizeof(format), "%u Hz  %u ch  %u kbps",
+        snprintf(format, sizeof(format), "%u Hz  %u ch  %u kbps  %u-%u/%u",
                  (unsigned)snapshot.sample_rate,
                  (unsigned)snapshot.channels,
-                 (unsigned)(snapshot.bitrate / 1000));
+                 (unsigned)(snapshot.bitrate / 1000),
+                 (unsigned)(first + 1),
+                 (unsigned)(first + RADIO_VISIBLE_ROWS),
+                 (unsigned)radio_station_count());
     } else {
-        snprintf(format, sizeof(format), "确认键播放，再按停止");
+        snprintf(format, sizeof(format), "确认键播放  %u-%u/%u",
+                 (unsigned)(first + 1),
+                 (unsigned)(first + RADIO_VISIBLE_ROWS),
+                 (unsigned)radio_station_count());
     }
-    ui_draw_text(16, 192, format, 1, UI_COLOR_MUTED);
+    ui_draw_text(16, 196, format, 1, UI_COLOR_MUTED);
 }
 
 static gui_action_t activate(uint8_t item) {
@@ -98,31 +145,31 @@ static gui_action_t activate(uint8_t item) {
     return GUI_ACTION_RADIO_TOGGLE;
 }
 
-static const gui_focus_node_t s_focus_grid[] = {
-    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = GUI_FOCUS_HOME, .down = 1},
-    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = 0, .down = 2},
-    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = 1, .down = 3},
-    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = 2, .down = 4},
-    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = 3, .down = GUI_FOCUS_HOME},
-};
+static bool handle_input(gui_input_t input, gui_action_t *action) {
+    if (input != GUI_INPUT_LEFT && input != GUI_INPUT_RIGHT) return false;
+    radio_player_snapshot_t snapshot;
+    radio_player_get_snapshot(&snapshot);
+    int level = snapshot.volume_level +
+                (input == GUI_INPUT_RIGHT ? 1 : -1);
+    if (level < RADIO_VOLUME_MIN) level = RADIO_VOLUME_MIN;
+    if (level > RADIO_VOLUME_MAX) level = RADIO_VOLUME_MAX;
+    radio_player_set_volume((uint8_t)level);
+    *action = GUI_ACTION_REDRAW;
+    return true;
+}
 
 static const gui_app_t s_app = {
     .id = "radio",
     .label = "网络电台",
     .icon = GUI_ICON_RADIO,
-    .focus_count = 5,
+    .focus_count = RADIO_STATION_COUNT,
     .focus_grid = s_focus_grid,
     .enter = enter,
     .exit = exit_app,
     .tick = tick,
     .render = render,
     .activate = activate,
-    .handle_input = NULL,
+    .handle_input = handle_input,
 };
 
 const gui_app_t *app_radio_descriptor(void) {

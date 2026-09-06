@@ -3,6 +3,7 @@
 #include "audio_io.h"
 #include "radio_stations.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,9 @@
 #define RADIO_PREFILL_BYTES (16 * 1024)
 #define RADIO_HTTP_TIMEOUT_MS 1500
 #define RADIO_WRITE_TIMEOUT_MS 2000
+#define RADIO_SPECTRUM_INTERVAL_MS 80
+#define RADIO_SPECTRUM_SAMPLES 128
+#define RADIO_TWO_PI 6.28318530717958647692f
 
 static const char *TAG = "radio_player";
 
@@ -31,9 +35,11 @@ static volatile bool s_stop_requested;
 static radio_player_snapshot_t s_snapshot = {
     .state = RADIO_PLAYER_IDLE,
     .station_index = 0,
+    .volume_level = 3,
     .message = "未播放",
 };
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_last_spectrum_ms;
 
 static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
@@ -65,8 +71,65 @@ static void finish_task(void) {
     vTaskDelete(NULL);
 }
 
-static esp_err_t push_pcm(const uint8_t *data, size_t size,
+static void process_pcm(int16_t *samples, size_t size, uint8_t channels) {
+    static const uint8_t gain_percent[] = {20, 40, 60, 80, 100};
+    uint8_t volume;
+    taskENTER_CRITICAL(&s_lock);
+    volume = s_snapshot.volume_level;
+    taskEXIT_CRITICAL(&s_lock);
+
+    size_t sample_count = size / sizeof(*samples);
+    int gain = gain_percent[volume - RADIO_VOLUME_MIN];
+    if (gain < 100) {
+        for (size_t i = 0; i < sample_count; ++i) {
+            samples[i] = (int16_t)(((int32_t)samples[i] * gain) / 100);
+        }
+    }
+
+    int64_t current_ms = now_ms();
+    size_t frame_count = sample_count / channels;
+    if (current_ms - s_last_spectrum_ms < RADIO_SPECTRUM_INTERVAL_MS ||
+        frame_count < RADIO_SPECTRUM_SAMPLES) {
+        return;
+    }
+    s_last_spectrum_ms = current_ms;
+
+    float values[RADIO_SPECTRUM_BANDS];
+    for (size_t band = 0; band < RADIO_SPECTRUM_BANDS; ++band) {
+        float coefficient =
+            2.0f * cosf(RADIO_TWO_PI * (float)(band + 1) /
+                        RADIO_SPECTRUM_SAMPLES);
+        float q0 = 0.0f;
+        float q1 = 0.0f;
+        float q2 = 0.0f;
+        for (size_t frame = 0; frame < RADIO_SPECTRUM_SAMPLES; ++frame) {
+            int32_t mono = samples[frame * channels];
+            if (channels == 2) {
+                mono = (mono + samples[frame * channels + 1]) / 2;
+            }
+            q0 = (float)mono + coefficient * q1 - q2;
+            q2 = q1;
+            q1 = q0;
+        }
+        float power = q1 * q1 + q2 * q2 - coefficient * q1 * q2;
+        values[band] = sqrtf(fmaxf(power, 0.0f)) /
+                       (RADIO_SPECTRUM_SAMPLES * 150.0f);
+    }
+
+    taskENTER_CRITICAL(&s_lock);
+    for (size_t band = 0; band < RADIO_SPECTRUM_BANDS; ++band) {
+        int level = (int)values[band];
+        if (level > 100) level = 100;
+        int smoothed = (s_snapshot.spectrum[band] * 2 + level) / 3;
+        s_snapshot.spectrum[band] = (uint8_t)smoothed;
+    }
+    ++s_snapshot.generation;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static esp_err_t push_pcm(uint8_t *data, size_t size, uint8_t channels,
                           bool *playback_started, size_t *prefill_bytes) {
+    process_pcm((int16_t *)data, size, channels);
     size_t offset = 0;
     while (offset < size && !s_stop_requested) {
         size_t written = audio_io_write_speaker(
@@ -171,6 +234,7 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
                     format_ready = true;
                 }
                 result = push_pcm(frame.buffer, frame.decoded_size,
+                                  s_snapshot.channels,
                                   &playback_started, &prefill_bytes);
                 if (result != ESP_OK) break;
             }
@@ -276,6 +340,7 @@ esp_err_t radio_player_start(size_t station_index) {
     s_snapshot.sample_rate = 0;
     s_snapshot.channels = 0;
     s_snapshot.bitrate = 0;
+    memset(s_snapshot.spectrum, 0, sizeof(s_snapshot.spectrum));
     s_snapshot.state = RADIO_PLAYER_CONNECTING;
     snprintf(s_snapshot.message, sizeof(s_snapshot.message), "准备连接");
     ++s_snapshot.generation;
@@ -319,5 +384,16 @@ void radio_player_get_snapshot(radio_player_snapshot_t *snapshot) {
     if (!snapshot) return;
     taskENTER_CRITICAL(&s_lock);
     *snapshot = s_snapshot;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+void radio_player_set_volume(uint8_t level) {
+    if (level < RADIO_VOLUME_MIN) level = RADIO_VOLUME_MIN;
+    if (level > RADIO_VOLUME_MAX) level = RADIO_VOLUME_MAX;
+    taskENTER_CRITICAL(&s_lock);
+    if (s_snapshot.volume_level != level) {
+        s_snapshot.volume_level = level;
+        ++s_snapshot.generation;
+    }
     taskEXIT_CRITICAL(&s_lock);
 }
