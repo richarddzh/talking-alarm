@@ -58,7 +58,8 @@ esp32_idf_s3n16r8/
 
 ADC 启动时自动采样中心值，并使用按下死区、释放迟滞、首次重复延迟和连续
 重复间隔。需要反转安装方向时，修改 `APP_JOYSTICK_X_INVERTED` 或
-`APP_JOYSTICK_Y_INVERTED`。GPIO19/20 已专用于 ADC，因此固件使用 UART
+`APP_JOYSTICK_Y_INVERTED`。当前硬件的 Y 轴已启用反转，使物理向上对应
+GUI 的向上事件。GPIO19/20 已专用于 ADC，因此固件使用 UART
 控制台，不启用占用同一组引脚的原生 USB Serial/JTAG 控制台。
 
 确认事件只由独立主按钮或辅助 B 按键产生。只有闲聊闹钟的动作卡会把确认映射为

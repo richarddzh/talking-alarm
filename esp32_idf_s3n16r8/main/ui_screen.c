@@ -11,28 +11,29 @@
 
 #define MAX_LINE_CHARS 52
 #define FRAMEBUFFER_BYTES (APP_UI_W * APP_UI_H / 2)
+#define PANEL_RGB565(color) ((uint16_t)(~(uint16_t)(color)))
 
 static const char *TAG = "ui";
 static uint8_t *s_framebuffer;
 static uint8_t *s_previous_framebuffer;
 static bool s_previous_valid;
 static const uint16_t s_palette[16] = {
-    [UI_COLOR_BLACK] = 0x0000,
-    [UI_COLOR_WHITE] = 0xFFFF,
-    [UI_COLOR_BG] = 0x0861,
-    [UI_COLOR_PANEL] = 0x18E3,
-    [UI_COLOR_PANEL_ALT] = 0x2945,
-    [UI_COLOR_PRIMARY] = 0x253F,
-    [UI_COLOR_PRIMARY_DARK] = 0x1297,
-    [UI_COLOR_FOCUS] = 0xFFE0,
-    [UI_COLOR_SUCCESS] = 0x07E0,
-    [UI_COLOR_WARNING] = 0xFD20,
-    [UI_COLOR_DANGER] = 0xF800,
-    [UI_COLOR_TEXT] = 0xEF7D,
-    [UI_COLOR_MUTED] = 0x8410,
-    [UI_COLOR_CYAN] = 0x07FF,
-    [UI_COLOR_MAGENTA] = 0xF81F,
-    [UI_COLOR_NAVY] = 0x0010,
+    [UI_COLOR_BLACK] = PANEL_RGB565(0x0000),
+    [UI_COLOR_WHITE] = PANEL_RGB565(0xFFFF),
+    [UI_COLOR_BG] = PANEL_RGB565(0x0861),
+    [UI_COLOR_PANEL] = PANEL_RGB565(0x18E3),
+    [UI_COLOR_PANEL_ALT] = PANEL_RGB565(0x2945),
+    [UI_COLOR_PRIMARY] = PANEL_RGB565(0x253F),
+    [UI_COLOR_PRIMARY_DARK] = PANEL_RGB565(0x1297),
+    [UI_COLOR_FOCUS] = PANEL_RGB565(0xFFE0),
+    [UI_COLOR_SUCCESS] = PANEL_RGB565(0x07E0),
+    [UI_COLOR_WARNING] = PANEL_RGB565(0xFD20),
+    [UI_COLOR_DANGER] = PANEL_RGB565(0xF800),
+    [UI_COLOR_TEXT] = PANEL_RGB565(0xEF7D),
+    [UI_COLOR_MUTED] = PANEL_RGB565(0x8410),
+    [UI_COLOR_CYAN] = PANEL_RGB565(0x07FF),
+    [UI_COLOR_MAGENTA] = PANEL_RGB565(0xF81F),
+    [UI_COLOR_NAVY] = PANEL_RGB565(0x0010),
 };
 
 static void truncate_into(char *dst, const char *src) {
