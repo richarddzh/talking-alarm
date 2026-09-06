@@ -40,6 +40,7 @@ static radio_player_snapshot_t s_snapshot = {
 };
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_spectrum_ms;
+static float s_spectrum_peak;
 
 static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
@@ -94,10 +95,14 @@ static void process_pcm(int16_t *samples, size_t size, uint8_t channels) {
     }
     s_last_spectrum_ms = current_ms;
 
+    static const uint8_t spectrum_bins[RADIO_SPECTRUM_BANDS] = {
+        1, 2, 3, 4, 5, 7, 9, 12, 16, 22,
+    };
     float values[RADIO_SPECTRUM_BANDS];
+    float frame_peak = 0.0f;
     for (size_t band = 0; band < RADIO_SPECTRUM_BANDS; ++band) {
         float coefficient =
-            2.0f * cosf(RADIO_TWO_PI * (float)(band + 1) /
+            2.0f * cosf(RADIO_TWO_PI * spectrum_bins[band] /
                         RADIO_SPECTRUM_SAMPLES);
         float q0 = 0.0f;
         float q1 = 0.0f;
@@ -113,14 +118,22 @@ static void process_pcm(int16_t *samples, size_t size, uint8_t channels) {
         }
         float power = q1 * q1 + q2 * q2 - coefficient * q1 * q2;
         values[band] = sqrtf(fmaxf(power, 0.0f)) /
-                       (RADIO_SPECTRUM_SAMPLES * 150.0f);
+                       RADIO_SPECTRUM_SAMPLES;
+        if (values[band] > frame_peak) frame_peak = values[band];
     }
 
+    s_spectrum_peak = fmaxf(frame_peak, s_spectrum_peak * 0.85f);
     taskENTER_CRITICAL(&s_lock);
     for (size_t band = 0; band < RADIO_SPECTRUM_BANDS; ++band) {
-        int level = (int)values[band];
-        if (level > 100) level = 100;
-        int smoothed = (s_snapshot.spectrum[band] * 2 + level) / 3;
+        int level = 0;
+        if (s_spectrum_peak >= 80.0f) {
+            float ratio = values[band] / s_spectrum_peak;
+            level = (int)(sqrtf(fminf(ratio, 1.0f)) * 100.0f);
+        }
+        int previous = s_snapshot.spectrum[band];
+        int smoothed = level > previous
+                           ? (previous + level * 2) / 3
+                           : previous > 8 ? previous - 8 : 0;
         s_snapshot.spectrum[band] = (uint8_t)smoothed;
     }
     ++s_snapshot.generation;
@@ -341,6 +354,8 @@ esp_err_t radio_player_start(size_t station_index) {
     s_snapshot.channels = 0;
     s_snapshot.bitrate = 0;
     memset(s_snapshot.spectrum, 0, sizeof(s_snapshot.spectrum));
+    s_last_spectrum_ms = 0;
+    s_spectrum_peak = 0.0f;
     s_snapshot.state = RADIO_PLAYER_CONNECTING;
     snprintf(s_snapshot.message, sizeof(s_snapshot.message), "准备连接");
     ++s_snapshot.generation;

@@ -9,8 +9,8 @@
 #define RADIO_ROW_Y 42
 #define RADIO_ROW_H 25
 #define RADIO_VISIBLE_ROWS 4
-#define RADIO_SPECTRUM_Y 154
-#define RADIO_SPECTRUM_H 39
+#define RADIO_SPECTRUM_Y 164
+#define RADIO_SPECTRUM_H 27
 
 static uint32_t s_seen_generation;
 static size_t s_selected_station;

@@ -2,6 +2,31 @@
 
 static const radio_station_t s_stations[] = {
     {
+        .name = "动感101",
+        .region = "上海",
+        .url = "https://lhttp.qtfm.cn/live/274/64k.mp3",
+    },
+    {
+        .name = "Love Radio",
+        .region = "上海",
+        .url = "https://lhttp.qtfm.cn/live/273/64k.mp3",
+    },
+    {
+        .name = "经典947",
+        .region = "上海",
+        .url = "https://lhttp.qtfm.cn/live/267/64k.mp3",
+    },
+    {
+        .name = "交通广播",
+        .region = "上海",
+        .url = "https://lhttp.qtfm.cn/live/266/64k.mp3",
+    },
+    {
+        .name = "新闻广播",
+        .region = "上海",
+        .url = "https://lhttp.qtfm.cn/live/270/64k.mp3",
+    },
+    {
         .name = "中国之声",
         .region = "中央",
         .url = "https://lhttp.qtfm.cn/live/15318317/64k.mp3",
@@ -47,6 +72,11 @@ static const radio_station_t s_stations[] = {
         .url = "https://lhttp.qtfm.cn/live/20012/64k.mp3",
     },
     {
+        .name = "北京新闻广播",
+        .region = "北京",
+        .url = "https://lhttp.qtfm.cn/live/339/64k.mp3",
+    },
+    {
         .name = "AsiaFM亚洲天空台",
         .region = "亚洲",
         .url = "https://lhttp.qingting.fm/live/20071/64k.mp3",
@@ -90,36 +120,6 @@ static const radio_station_t s_stations[] = {
         .name = "NPR Program Stream",
         .region = "美国",
         .url = "https://npr-ice.streamguys1.com/live.mp3",
-    },
-    {
-        .name = "北京新闻广播",
-        .region = "北京",
-        .url = "https://lhttp.qtfm.cn/live/339/64k.mp3",
-    },
-    {
-        .name = "动感101",
-        .region = "上海",
-        .url = "https://lhttp.qtfm.cn/live/274/64k.mp3",
-    },
-    {
-        .name = "Love Radio",
-        .region = "上海",
-        .url = "https://lhttp.qtfm.cn/live/273/64k.mp3",
-    },
-    {
-        .name = "经典947",
-        .region = "上海",
-        .url = "https://lhttp.qtfm.cn/live/267/64k.mp3",
-    },
-    {
-        .name = "交通广播",
-        .region = "上海",
-        .url = "https://lhttp.qtfm.cn/live/266/64k.mp3",
-    },
-    {
-        .name = "新闻广播",
-        .region = "上海",
-        .url = "https://lhttp.qtfm.cn/live/270/64k.mp3",
     },
 };
 
