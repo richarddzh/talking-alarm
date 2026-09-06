@@ -1,0 +1,95 @@
+# --- Hardware target: ESP32-S3 N16R8 ------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Partition table -----------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- Flash: 16 MB Quad SPI, matching the detected board ------------------
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHMODE="dio"
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# --- 8 MB Octal PSRAM ----------------------------------------------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# --- Console: USB-UART bridge plus native USB Serial/JTAG ----------------
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# --- Compiler: optimise for size ----------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_STACK_CHECK_MODE_NONE=y
+
+# --- Core placement --------------------------------------------------------
+# Keep the main task, Wi-Fi and lwIP on Core 0.
+# audio_io is pinned to Core 1 in code via xTaskCreatePinnedToCore(..., 1)
+# so TLS / lwIP activity does not interfere with I2S DMA timing.
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+# --- FreeRTOS ------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# --- Wi-Fi: keep modest buffer counts to save heap ----------------------
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+
+# --- LWIP ---------------------------------------------------------------
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_MAX_SOCKETS=6
+
+# --- HTTP setup portal ---------------------------------------------------
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+
+# --- mbedTLS / TLS: minimal config, skip certificate verification ----------
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+# Skip the root certificate bundle to save flash and heap.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+# Disable time-based validation because system time is not configured.
+CONFIG_MBEDTLS_HAVE_TIME=n
+CONFIG_MBEDTLS_HAVE_TIME_DATE=n
+# Allow esp_tls_cfg_t to skip server certificate verification entirely:
+#   - cfg.skip_common_name = true
+#   - cfg.crt_bundle_attach = NULL
+#   - cfg.cacert_buf = NULL
+# Together with the Kconfig options below, esp_tls switches mbedTLS to
+# MBEDTLS_SSL_VERIFY_NONE. This matches the insecure Arduino
+# WiFiClientSecure::setInsecure() behavior while reducing memory use.
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# --- SPIFFS -------------------------------------------------------------
+CONFIG_SPIFFS_PAGE_SIZE=256
+CONFIG_SPIFFS_OBJ_NAME_LEN=32
+
+# --- Logging ------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+# --- Main task stack ----------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144

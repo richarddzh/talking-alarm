@@ -1,0 +1,43 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "app_i2c.c"
+        "buttons.c"
+        "onboard_led.c"
+        "ring.c"
+        "audio_io.c"
+        "app_secret_store.c"
+        "wifi_creds.c"
+        "wifi_provision.c"
+        "wifi_time.c"
+        "rtc_ds3231.c"
+        "voice_chat.c"
+        "chime_player.c"
+        "doubao_asr_client.c"
+        "doubao_agent_client.c"
+        "doubao_tts_player.c"
+        "ui_screen.c"
+        "gui_shell.c"
+        "app_chat_alarm.c"
+        "app_settings.c"
+        "st7789.c"
+        "font5x7.c"
+        "font_zh16.c"
+        "mem_log.c"
+    INCLUDE_DIRS "."
+    EMBED_FILES
+        "assets/unifont_bmp16.bin"
+    REQUIRES
+        driver
+        esp_driver_rmt
+        esp_timer
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_client
+        esp_http_server
+        esp-tls
+        mbedtls
+        nvs_flash
+        spiffs
+)
