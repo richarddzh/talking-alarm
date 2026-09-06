@@ -8,7 +8,7 @@
 - `X`：ADC 模拟横轴；
 - `Y`：ADC 模拟纵轴。
 
-按设备实测后的有效映射为 B/GPIO21、X/GPIO19、Y/GPIO20。X/Y 不能进入数字按键去抖
+最终接线映射为 B/GPIO21、X/GPIO20、Y/GPIO19。X/Y 不能进入数字按键去抖
 数组，也不能直接产生 `GUI_INPUT_ACTIVATE`。
 
 `buttons.c` 启动时对每个轴采样 32 次建立中心值。方向判定使用两级阈值：

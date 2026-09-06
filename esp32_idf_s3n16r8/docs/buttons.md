@@ -1,15 +1,15 @@
 # 按钮与 GUI 导航说明
 
 项目使用 GPIO4 主按钮，以及摇杆的 B/X/Y 三路输入。B 是 GPIO21 上低电平
-有效的数字按键；X/Y 分别是 GPIO19/20 上的 ADC 模拟轴。数字输入执行 30 ms
+有效的数字按键；X/Y 分别是 GPIO20/19 上的 ADC 模拟轴。数字输入执行 30 ms
 软件去抖，模拟轴使用中心校准、死区、迟滞和重复节流。
 
 | 输入 | GPIO | 默认 GUI 功能 |
 |---|---:|---|
 | 主按钮 | 4 | 松开时确认当前焦点 |
 | B | 21 | 可重映射的辅助确认键 |
-| X | 19 | ADC 横轴，产生左/右 |
-| Y | 20 | ADC 纵轴，产生上/下 |
+| X | 20 | ADC 横轴，产生左/右 |
+| Y | 19 | ADC 纵轴，产生上/下 |
 
 焦点包含内容区控件和底部“首页”按钮。每个 App 使用显式四方向邻接表。
 确认“首页”后进入 App 主导航；在主导航确认图标后打开对应 App。主按钮
@@ -54,8 +54,8 @@ X/Y 只产生方向事件，绝不产生确认事件。
 
 - `APP_BUTTON_PIN = 4`
 - `APP_JOYSTICK_BUTTON_PIN = 21`
-- `APP_JOYSTICK_X_PIN = 19`
-- `APP_JOYSTICK_Y_PIN = 20`
+- `APP_JOYSTICK_X_PIN = 20`
+- `APP_JOYSTICK_Y_PIN = 19`
 - `APP_BUTTON_DEBOUNCE_MS = 30`
 - `APP_BUTTON_LONG_PRESS_MS = 800`
 - `APP_VOICE_MAX_RECORD_MS = 10000`

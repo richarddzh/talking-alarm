@@ -27,8 +27,8 @@
 // ---- Buttons (active-low, internal pull-up) ----------------------------
 #define APP_BUTTON_PIN             4
 #define APP_JOYSTICK_BUTTON_PIN    21
-#define APP_JOYSTICK_X_PIN         19
-#define APP_JOYSTICK_Y_PIN         20
+#define APP_JOYSTICK_X_PIN         20
+#define APP_JOYSTICK_Y_PIN         19
 #define APP_JOYSTICK_X_INVERTED    false
 #define APP_JOYSTICK_Y_INVERTED    false
 #define APP_BUTTON_DEBOUNCE_MS     30

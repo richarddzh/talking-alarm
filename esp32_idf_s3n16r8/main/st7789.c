@@ -138,8 +138,8 @@ esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
             uint8_t index =
                 (source_x & 1) ? (packed & 0x0F) : (packed >> 4);
             uint16_t color = palette[index];
-            s_line[column * 2] = color >> 8;
-            s_line[column * 2 + 1] = color;
+            s_line[column * 2] = color;
+            s_line[column * 2 + 1] = color >> 8;
         }
         err = transmit(true, s_line, (size_t)width * 2);
         if (err != ESP_OK) return err;

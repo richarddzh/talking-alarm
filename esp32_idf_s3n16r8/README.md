@@ -208,7 +208,7 @@ ESP32 直接调用豆包 ASR、Agent 和 TTS。API key 不再通过编译期 `ma
 |----------------------------|----------------|
 | 独立主确认按钮（低电平有效） | GPIO 4 |
 | 摇杆 B 辅助确认（低电平有效） | GPIO 21 |
-| 摇杆 X / Y 模拟轴 | GPIO 19 / 20（ADC） |
+| 摇杆 X / Y 模拟轴 | GPIO 20 / 19（ADC） |
 | DS3231 I2C SDA / SCL       | GPIO 8/9       |
 | ST7789 SCL / SDA / DC / CS | GPIO 11/12/13/14 |
 | 麦克风 BCLK / LRCK / SD    | GPIO 2/1/42    |
