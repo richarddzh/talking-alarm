@@ -297,7 +297,6 @@ static bool ensure_wifi_connected(const char *reason) {
         }
         s_last_wifi_retry_ms = now_ms();
         render_home();
-        set_setup_ap(true);
         return false;
     }
 
@@ -448,9 +447,6 @@ static void set_setup_ap(bool on) {
                 if (ensure_wifi_connected("setup off")) {
                     mem_log("wifi back");
                 }
-            } else {
-                set_setup_ap(true);
-                return;
             }
         } else {
             s_setup_mode = true;
@@ -480,8 +476,50 @@ static void dispatch_gui_action(gui_action_t action) {
     case GUI_ACTION_TOGGLE_QUIET:
         toggle_quiet_mode();
         break;
-    case GUI_ACTION_TOGGLE_SETUP:
-        set_setup_ap(!s_setup_mode);
+    case GUI_ACTION_WIFI_SCAN: {
+        if (s_setup_mode || wifi_provision_active()) {
+            app_settings_set_wifi_scan(NULL, 0, ESP_ERR_INVALID_STATE);
+            break;
+        }
+        if (audio_activity_busy()) {
+            app_settings_set_wifi_status("音频使用中，稍后重试");
+            break;
+        }
+        wifi_scan_ap_t results[WIFI_SCAN_MAX_RESULTS];
+        size_t count = 0;
+        esp_err_t err = wifi_time_scan(results, WIFI_SCAN_MAX_RESULTS, &count);
+        app_settings_set_wifi_scan(results, count, err);
+        break;
+    }
+    case GUI_ACTION_WIFI_CONNECT: {
+        wifi_creds_t creds;
+        if (!app_settings_take_wifi_credentials(&creds)) break;
+        if (audio_activity_busy()) {
+            app_settings_set_wifi_status("音频使用中，无法切换");
+            break;
+        }
+        if (s_setup_mode) set_setup_ap(false);
+        wifi_time_disconnect();
+        wifi_time_set_credentials(&creds);
+        snprintf(s_status_msg, sizeof(s_status_msg), "连接 %s", creds.ssid);
+        render_home();
+        esp_err_t err = wifi_time_connect();
+        if (err == ESP_OK) {
+            snprintf(s_status_msg, sizeof(s_status_msg), "WiFi connected");
+            app_settings_set_wifi_status("连接成功");
+            s_last_wifi_retry_ms = now_ms();
+        } else {
+            snprintf(s_status_msg, sizeof(s_status_msg), "WiFi: %s",
+                     wifi_time_last_disconnect_reason_text());
+            app_settings_set_wifi_status(wifi_time_last_disconnect_reason_text());
+        }
+        break;
+    }
+    case GUI_ACTION_API_SETUP_START:
+        set_setup_ap(true);
+        break;
+    case GUI_ACTION_API_SETUP_STOP:
+        set_setup_ap(false);
         break;
     case GUI_ACTION_SYNC_TIME:
         sync_time_from_wifi("settings");
@@ -493,7 +531,7 @@ static void dispatch_gui_action(gui_action_t action) {
             break;
         }
         if (!wifi_time_has_credentials()) {
-            set_setup_ap(true);
+            snprintf(s_status_msg, sizeof(s_status_msg), "请先设置 WiFi");
             break;
         }
         if (!ensure_wifi_connected("voice")) break;
@@ -529,7 +567,7 @@ static void dispatch_gui_action(gui_action_t action) {
             break;
         }
         if (!wifi_time_has_credentials()) {
-            set_setup_ap(true);
+            snprintf(s_status_msg, sizeof(s_status_msg), "请先设置 WiFi");
             break;
         }
         if (!ensure_wifi_connected("radio")) break;
@@ -589,14 +627,6 @@ static void handle_button_long_press(void) {
         return;
     }
 
-    if (s_setup_mode) {
-        s_button_long_handled = true;
-        snprintf(s_status_msg, sizeof(s_status_msg), "leaving setup AP");
-        render_home();
-        set_setup_ap(false);
-        return;
-    }
-
     gui_action_t action = gui_shell_handle_input(GUI_INPUT_LONG_PRESS);
     if (action == GUI_ACTION_NONE) return;
     s_button_long_handled = true;
@@ -608,22 +638,16 @@ static void handle_button_long_press(void) {
 static void poll_wifi_provision(void) {
     if (!wifi_provision_active()) return;
 
-    wifi_creds_t wc;
-    bool got_update = wifi_provision_take_update(&wc);
-    if (got_update) {
-        wifi_time_set_credentials(&wc);
-        snprintf(s_status_msg, sizeof(s_status_msg), "Config saved %s", wc.ssid);
-        memset(&s_last_time, 0, sizeof(s_last_time));
-    }
-
     const char *st = wifi_provision_take_status();
-    if (st && !got_update) snprintf(s_status_msg, sizeof(s_status_msg), "%s", st);
-
-    if (st || got_update) render_home();
+    if (st) {
+        snprintf(s_status_msg, sizeof(s_status_msg), "%s", st);
+        render_home();
+    }
 }
 
 // --- Boot --------------------------------------------------------------
 static void initialise(void) {
+    ESP_ERROR_CHECK(audio_io_quiet_speaker_pins());
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase(); nvs_flash_init();
@@ -639,7 +663,7 @@ static void initialise(void) {
         wifi_time_set_credentials(&wc);
         snprintf(s_status_msg, sizeof(s_status_msg), "WiFi file %s", wc.ssid);
     } else {
-        snprintf(s_status_msg, sizeof(s_status_msg), "Starting setup AP");
+        snprintf(s_status_msg, sizeof(s_status_msg), "WiFi not configured");
     }
     app_secrets_t secrets;
     if (app_secrets_load(&secrets) == 0) {
@@ -670,7 +694,8 @@ static void initialise(void) {
     render_home();
 
     if (!wifi_time_has_credentials()) {
-        set_setup_ap(true);
+        snprintf(s_status_msg, sizeof(s_status_msg), "请在设置中配置 WiFi");
+        render_home();
     } else if (ensure_wifi_connected("boot")) {
         sync_time_from_wifi("boot");
     }

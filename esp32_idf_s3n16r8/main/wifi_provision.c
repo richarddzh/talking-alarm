@@ -21,8 +21,6 @@ static httpd_handle_t s_httpd;
 static esp_netif_t *s_ap_netif;
 static bool s_active;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static wifi_creds_t s_pending_creds;
-static bool s_has_update;
 static char s_pending_status[64];
 static bool s_has_status;
 static char s_returned_status[64];
@@ -32,29 +30,6 @@ static void set_status(const char *msg) {
     snprintf(s_pending_status, sizeof(s_pending_status), "%s", msg);
     s_has_status = true;
     portEXIT_CRITICAL(&s_lock);
-}
-
-static void html_escape(const char *in, char *out, size_t cap) {
-    size_t w = 0;
-    for (const char *p = in; *p && w + 1 < cap; ++p) {
-        const char *rep = NULL;
-        switch (*p) {
-        case '&': rep = "&amp;"; break;
-        case '<': rep = "&lt;"; break;
-        case '>': rep = "&gt;"; break;
-        case '"': rep = "&quot;"; break;
-        default: break;
-        }
-        if (rep) {
-            size_t n = strlen(rep);
-            if (w + n >= cap) break;
-            memcpy(out + w, rep, n);
-            w += n;
-        } else {
-            out[w++] = *p;
-        }
-    }
-    out[w] = 0;
 }
 
 static int hex_val(char c) {
@@ -107,18 +82,12 @@ static bool form_value(const char *body, const char *key, char *out, size_t cap)
 }
 
 static esp_err_t send_page(httpd_req_t *req, const char *message) {
-    wifi_creds_t wc;
-    char ssid[64] = {0};
-    const bool have_wifi = wifi_creds_load(&wc) == 0;
     app_secrets_t *secrets = calloc(1, sizeof(*secrets));
     if (!secrets) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
         return ESP_OK;
     }
     app_secrets_load_partial(secrets);
-    if (have_wifi) {
-        html_escape(wc.ssid, ssid, sizeof(ssid));
-    }
     const bool have_asr = secrets->asr_api_key[0] != 0;
     const bool have_agent = secrets->agent_api_key[0] != 0;
     const bool have_tts = secrets->tts_api_key[0] != 0;
@@ -132,19 +101,11 @@ static esp_err_t send_page(httpd_req_t *req, const char *message) {
     snprintf(page, SETUP_PAGE_MAX,
              "<!doctype html><html><head><meta name=\"viewport\" "
              "content=\"width=device-width,initial-scale=1\">"
-             "<title>talkingflower setup</title></head>"
-             "<body><h1>talkingflower setup</h1>"
+             "<title>talkingflower API setup</title></head>"
+             "<body><h1>talkingflower API setup</h1>"
              "<p>%s</p>"
-             "<p>Use each Save button independently.</p>"
-             "<form method=\"post\" action=\"/\">"
-             "<input type=\"hidden\" name=\"action\" value=\"wifi\">"
-             "<h2>WiFi</h2>"
-             "<label>WiFi name<br><input name=\"ssid\" value=\"%s\" "
-             "maxlength=\"32\" required></label><br><br>"
-             "<label>WiFi password<br><input name=\"password\" type=\"password\" "
-             "maxlength=\"64\" placeholder=\"%s\"></label><br><br>"
-             "<button type=\"submit\">Save WiFi</button>"
-             "</form>"
+             "<p>WiFi networks are configured on the device screen. "
+             "Use each Save button below independently.</p>"
              "<form method=\"post\" action=\"/\">"
              "<input type=\"hidden\" name=\"action\" value=\"asr\">"
              "<h2>Doubao ASR API key</h2>"
@@ -166,11 +127,9 @@ static esp_err_t send_page(httpd_req_t *req, const char *message) {
              "maxlength=\"255\" placeholder=\"%s\"></label><br><br>"
              "<button type=\"submit\">Save TTS key</button>"
              "</form>"
-             "<p>After saving config, long-press the device button to connect.</p>"
+             "<p>Return to the device and select Exit setup mode when finished.</p>"
              "</body></html>",
-             message ? message : "Save WiFi and API keys, then long-press the button to connect.",
-             ssid,
-             have_wifi ? "leave blank to keep saved password" : "required",
+             message ? message : "Save API keys, then exit setup mode on the device.",
              have_asr ? "saved; enter new value to replace" : "required",
              have_agent ? "saved; enter new value to replace" : "required",
              have_tts ? "saved; enter new value to replace" : "required");
@@ -214,44 +173,6 @@ static esp_err_t root_post(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid action");
         set_status("Invalid action");
         return ESP_OK;
-    }
-
-    if (strcmp(action, "wifi") == 0) {
-        wifi_creds_t wc = {0};
-        wifi_creds_t old_wc = {0};
-        bool have_old_wifi = wifi_creds_load(&old_wc) == 0;
-        if (!form_value(body, "ssid", wc.ssid, sizeof(wc.ssid)) ||
-            !form_value(body, "password", wc.password, sizeof(wc.password))) {
-            free(body);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid WiFi credentials");
-            set_status("Invalid WiFi form");
-            return ESP_OK;
-        }
-        if (!wc.password[0] && have_old_wifi) {
-            snprintf(wc.password, sizeof(wc.password), "%s", old_wc.password);
-        }
-        if (!wifi_creds_valid(&wc)) {
-            free(body);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "WiFi password required");
-            set_status("WiFi pass needed");
-            return ESP_OK;
-        }
-        if (wifi_creds_save(&wc) != 0) {
-            free(body);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "WiFi save failed");
-            set_status("WiFi save fail");
-            return ESP_OK;
-        }
-
-        portENTER_CRITICAL(&s_lock);
-        s_pending_creds = wc;
-        s_has_update = true;
-        snprintf(s_pending_status, sizeof(s_pending_status), "WiFi saved %s", wc.ssid);
-        s_has_status = true;
-        portEXIT_CRITICAL(&s_lock);
-
-        free(body);
-        return send_page(req, "WiFi saved. Long-press the button to connect.");
     }
 
     app_secrets_t secrets = {0};
@@ -393,18 +314,6 @@ esp_err_t wifi_provision_stop(void) {
 
 bool wifi_provision_active(void) {
     return s_active;
-}
-
-bool wifi_provision_take_update(wifi_creds_t *out) {
-    portENTER_CRITICAL(&s_lock);
-    if (!s_has_update) {
-        portEXIT_CRITICAL(&s_lock);
-        return false;
-    }
-    if (out) *out = s_pending_creds;
-    s_has_update = false;
-    portEXIT_CRITICAL(&s_lock);
-    return true;
 }
 
 const char *wifi_provision_take_status(void) {

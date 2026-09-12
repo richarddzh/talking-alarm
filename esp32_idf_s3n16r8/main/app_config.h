@@ -93,6 +93,7 @@
 // ---- Storage -----------------------------------------------------------
 #define APP_SPIFFS_BASE_PATH         "/spiffs"
 #define APP_WIFI_CONFIG_PATH         "/spiffs/wifi_config.txt"
+#define APP_WIFI_PROFILES_PATH       "/spiffs/wifi_profiles.bin"
 #define APP_SECRETS_CONFIG_PATH      "/spiffs/app_secrets.txt"
 
 // ---- Wi-Fi provisioning AP ---------------------------------------------

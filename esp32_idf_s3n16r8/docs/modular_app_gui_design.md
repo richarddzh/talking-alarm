@@ -102,7 +102,9 @@ X/Y 已由 ADC 输入适配层映射为 `UP/DOWN/LEFT/RIGHT`。游戏 App 可以
 设置 App：
 
 - 安静模式开关。
-- Wi-Fi 配置 AP 开关。
+- Wi-Fi 扫描、历史网络选择与手动 SSID/密码输入。
+- 摇杆操作的屏幕虚拟键盘。
+- API Key 配置 SoftAP 开关及连接信息页。
 - 立即网络校时。
 
 ### `app_main.c`
@@ -164,13 +166,15 @@ typedef struct {
 
 ### 设置
 
-竖向三项：
+竖向四项：
 
 1. Quiet mode：切换自动报时静音。
-2. WiFi setup：开启或关闭 SoftAP 配网页。
-3. Sync time：立即通过 Wi-Fi 校时并写入 DS3231。
+2. WiFi settings：扫描/选择/输入 Wi-Fi，并管理历史网络。
+3. API settings：开启只维护 API Key 的 SoftAP 配网页。
+4. Sync time：立即通过 Wi-Fi 校时并写入 DS3231。
 
-每项使用选中外框，状态值显示在右侧。
+每项使用选中外框，状态值显示在右侧。Wi-Fi 子页和虚拟键盘通过 App 的
+`handle_input()` 接管摇杆方向及确认输入。
 
 ### 主导航
 

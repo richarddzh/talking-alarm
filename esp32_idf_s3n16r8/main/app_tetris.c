@@ -8,9 +8,9 @@
 
 #define BOARD_W 10
 #define BOARD_H 16
-#define BLOCK 10
-#define BOARD_X 10
-#define BOARD_Y 37
+#define BLOCK 12
+#define BOARD_X 4
+#define BOARD_Y 12
 #define DROP_MS 520
 
 typedef struct {
@@ -148,8 +148,13 @@ static gui_action_t tick(int64_t now_ms) {
 }
 
 static void draw_block(int x, int y, ui_color_t color) {
-    ui_fill_round_rect(x + 1, y + 1, BLOCK - 2, BLOCK - 2, 2, color);
-    ui_draw_line(x + 2, y + 2, x + BLOCK - 4, y + 2, UI_COLOR_WHITE);
+    ui_fill_rect(x + 1, y + 1, BLOCK - 2, BLOCK - 2, color);
+    ui_draw_line(x + 2, y + 2, x + BLOCK - 3, y + 2, UI_COLOR_WHITE);
+    ui_draw_line(x + 2, y + 2, x + 2, y + BLOCK - 3, UI_COLOR_WHITE);
+    ui_draw_line(x + 3, y + BLOCK - 2, x + BLOCK - 2,
+                 y + BLOCK - 2, UI_COLOR_PRIMARY_DARK);
+    ui_draw_line(x + BLOCK - 2, y + 3, x + BLOCK - 2,
+                 y + BLOCK - 2, UI_COLOR_PRIMARY_DARK);
 }
 
 static void draw_piece_preview(int piece, int center_x, int center_y) {
@@ -163,7 +168,7 @@ static void draw_piece_preview(int piece, int center_x, int center_y) {
 
 static void render(const gui_model_t *model, int focused_item) {
     (void)model;
-    ui_draw_text(10, 8, "俄罗斯方块", 2, UI_COLOR_TEXT);
+    ui_draw_text(139, 8, "俄罗斯方块", 2, UI_COLOR_TEXT);
     ui_draw_rect(BOARD_X - 2, BOARD_Y - 2,
                  BOARD_W * BLOCK + 4, BOARD_H * BLOCK + 4,
                  2, UI_COLOR_PANEL_ALT);
@@ -189,25 +194,25 @@ static void render(const gui_model_t *model, int focused_item) {
     }
 
     char value[24];
-    ui_draw_text(132, 42, "积分", 2, UI_COLOR_MUTED);
+    ui_draw_text(140, 46, "积分", 1, UI_COLOR_MUTED);
     snprintf(value, sizeof(value), "%d", s_score);
-    ui_draw_text(132, 64, value, 3, UI_COLOR_FOCUS);
-    ui_draw_text(132, 94, "消行", 2, UI_COLOR_MUTED);
+    ui_draw_text(140, 61, value, 2, UI_COLOR_FOCUS);
+    ui_draw_text(224, 46, "消行", 1, UI_COLOR_MUTED);
     snprintf(value, sizeof(value), "%d", s_lines);
-    ui_draw_text(132, 116, value, 2, UI_COLOR_TEXT);
-    ui_draw_text(132, 142, "下一个", 2, UI_COLOR_MUTED);
-    draw_piece_preview(s_next, 205, 174);
+    ui_draw_text(224, 61, value, 2, UI_COLOR_TEXT);
+    ui_draw_text(140, 96, "下一个", 1, UI_COLOR_MUTED);
+    draw_piece_preview(s_next, 204, 127);
 
-    ui_fill_round_rect(226, 42, 82, 34, 7,
+    ui_fill_round_rect(239, 5, 74, 28, 5,
                        focused_item == 0 ? UI_COLOR_PRIMARY_DARK
                                          : UI_COLOR_PANEL);
-    ui_draw_rect(226, 42, 82, 34, focused_item == 0 ? 3 : 1,
+    ui_draw_rect(239, 5, 74, 28, focused_item == 0 ? 3 : 1,
                  focused_item == 0 ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-    ui_draw_text(238, 51, s_running ? "重开" : "开始", 2,
+    ui_draw_text(260, 15, s_running ? "重开" : "开始", 1,
                  focused_item == 0 ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     if (s_game_over) {
-        ui_fill_round_rect(28, 100, 66, 42, 6, UI_COLOR_DANGER);
-        ui_draw_text(35, 113, "结束", 2, UI_COLOR_WHITE);
+        ui_fill_rect(24, 92, 80, 36, UI_COLOR_DANGER);
+        ui_draw_text(32, 102, "游戏结束", 1, UI_COLOR_WHITE);
     }
 }
 

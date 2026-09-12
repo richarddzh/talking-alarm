@@ -1,6 +1,7 @@
 #include "gui_shell.h"
 
 #include "app_config.h"
+#include "launcher_icons_data.h"
 #include "ui_screen.h"
 
 #include <string.h>
@@ -75,74 +76,48 @@ static void draw_status_bar(const gui_model_t *model) {
                    model->wifi_connected || model->setup_mode);
 }
 
-static void draw_chat_icon(int x, int y, ui_color_t color) {
-    ui_draw_rect(x, y, 42, 30, 3, color);
-    ui_draw_line(x + 8, y + 30, x + 3, y + 38, color);
-    ui_draw_line(x + 8, y + 30, x + 16, y + 30, color);
-    ui_fill_rect(x + 9, y + 12, 4, 4, color);
-    ui_fill_rect(x + 19, y + 12, 4, 4, color);
-    ui_fill_rect(x + 29, y + 12, 4, 4, color);
-}
-
-static void draw_settings_icon(int x, int y, ui_color_t color) {
-    ui_draw_rect(x + 10, y + 10, 28, 28, 3, color);
-    ui_draw_rect(x + 18, y + 18, 12, 12, 3, color);
-    ui_fill_rect(x + 21, y, 6, 10, color);
-    ui_fill_rect(x + 21, y + 38, 6, 10, color);
-    ui_fill_rect(x, y + 21, 10, 6, color);
-    ui_fill_rect(x + 38, y + 21, 10, 6, color);
-}
-
-static void draw_icon(gui_icon_t icon, int x, int y, ui_color_t color) {
-    switch (icon) {
-    case GUI_ICON_SETTINGS:
-        draw_settings_icon(x, y, color);
-        break;
-    case GUI_ICON_RADIO:
-        ui_draw_rect(x, y + 8, 48, 34, 3, color);
-        ui_draw_line(x + 8, y + 8, x + 36, y, color);
-        ui_draw_rect(x + 28, y + 17, 12, 12, 2, color);
-        break;
-    case GUI_ICON_TETRIS:
-        ui_fill_rect(x, y, 16, 16, color);
-        ui_fill_rect(x + 16, y + 16, 16, 16, color);
-        ui_fill_rect(x + 32, y + 16, 16, 16, color);
-        break;
-    case GUI_ICON_SNAKE:
-        ui_draw_line(x, y + 8, x + 18, y + 8, color);
-        ui_draw_line(x + 18, y + 8, x + 18, y + 28, color);
-        ui_draw_line(x + 18, y + 28, x + 42, y + 28, color);
-        ui_fill_rect(x + 40, y + 26, 8, 8, color);
-        break;
-    case GUI_ICON_CHAT:
-    default:
-        draw_chat_icon(x + 3, y + 4, color);
-        break;
+static void draw_icon(gui_icon_t icon, int x, int y) {
+    if ((size_t)icon >= sizeof(s_launcher_icon_pixels) /
+                        sizeof(s_launcher_icon_pixels[0])) {
+        icon = GUI_ICON_CHAT;
+    }
+    const uint8_t *pixels = s_launcher_icon_pixels[icon];
+    const ui_color_t *palette = s_launcher_icon_palettes[icon];
+    for (int row = 0; row < LAUNCHER_ICON_H; ++row) {
+        for (int column = 0; column < LAUNCHER_ICON_W; ++column) {
+            int pixel_index = row * LAUNCHER_ICON_W + column;
+            uint8_t packed = pixels[pixel_index / 2];
+            uint8_t color_index = (pixel_index & 1)
+                                      ? packed & 0x0f : packed >> 4;
+            if (color_index == 0) continue;
+            ui_fill_rect(x + column * 2, y + row * 2, 2, 2,
+                         palette[color_index]);
+        }
     }
 }
 
 static void render_launcher(void) {
-    ui_draw_text(16, 12, "应用", 4, UI_COLOR_TEXT);
-    ui_draw_text(18, 50, "请选择一个应用", 2, UI_COLOR_MUTED);
+    ui_fill_rect(0, 0, APP_UI_W, 32, UI_COLOR_NAVY);
+    ui_draw_text(12, 8, "应用", 2, UI_COLOR_TEXT);
+    ui_draw_text(12, 38, "请选择一个应用", 1, UI_COLOR_MUTED);
 
     const int card_w = 94;
-    const int card_h = 68;
+    const int card_h = 70;
     const int gap = 9;
     for (size_t i = 0; i < s_app_count; ++i) {
         int column = (int)(i % 3);
         int row = (int)(i / 3);
         int x = 9 + column * (card_w + gap);
-        int y = 56 + row * (card_h + 4);
+        int y = 50 + row * (card_h + 3);
         if (y + card_h > CONTENT_BOTTOM) break;
         bool selected = s_focus == (int)i;
         ui_fill_rect(x, y, card_w, card_h,
                      selected ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL);
         ui_draw_rect(x, y, card_w, card_h, selected ? 4 : 2,
                      selected ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-        draw_icon(s_apps[i]->icon, x + 23, y + 4,
-                  selected ? UI_COLOR_FOCUS : UI_COLOR_CYAN);
-        draw_centered_text(x + card_w / 2, y + 50, s_apps[i]->label,
-                           2, selected ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
+        draw_icon(s_apps[i]->icon, x + 23, y + 2);
+        draw_centered_text(x + card_w / 2, y + 53, s_apps[i]->label,
+                           1, selected ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     }
 }
 

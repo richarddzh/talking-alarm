@@ -289,14 +289,21 @@ idf.py build
 idf.py -p COM6 flash monitor
 ```
 
-第一次启动时 SPIFFS 会自动格式化。没有有效 Wi-Fi 配置或连接失败时，
-设备会自动启动 SoftAP：
+第一次启动时 SPIFFS 会自动格式化。设备“设置” App 现在把网络配置拆成
+“WiFi 设置”和“API 设置”：
 
-- SSID: `talkingflower`
-- Password: `pangmiaomiao`
-- URL: `http://192.168.4.1/`
+- “WiFi 设置”会扫描附近网络，同时列出最多 8 个历史网络；可直接选择
+  已保存网络、选择扫描结果后输入密码，或手动填写隐藏 SSID。
+- 屏幕虚拟键盘由摇杆移动焦点、任一确认按钮选键，支持文本光标左右移动、
+  退格、大小写/数字符号切换、确定和取消。
+- 旧 `/spiffs/wifi_config.txt` 会自动作为第一个历史网络使用，现有 Wi-Fi
+  配置不会丢失；新的历史列表保存在 `/spiffs/wifi_profiles.bin`。
+- “API 设置”才启动 SoftAP 网页：SSID `talkingflower`，密码
+  `pangmiaomiao`，URL `http://192.168.4.1/`。
 
-TFT 会停留在配置页，显示热点名、密码和 URL。网页配置页分成 4 个独立保存按钮：Wi-Fi name + Wi-Fi password、Doubao ASR API key、Doubao Agent API key、Doubao TTS API key，可以单独更新其中一项。保存后长按 GPIO4 按钮，设备关闭 AP，按保存的 Wi-Fi 配置尝试联网；连接失败时会自动重新开启 AP，并显示 ESP-IDF disconnect reason，例如 `no AP found (201)`、`auth failed (202)`、`handshake timeout (204)`。
+API 设置页会显示热点名、密码、URL 和“退出设置模式”按钮。网页只维护
+Doubao ASR、Agent、TTS 三个 API Key，原有 `/spiffs/app_secrets.txt`
+内容保持不变。退出 API 设置后，设备会使用当前选中的 Wi-Fi 配置恢复联网。
 
 详细设计记录见 [docs/2026-06-21-softap-provisioning.md](docs/2026-06-21-softap-provisioning.md)。
 
@@ -344,10 +351,10 @@ esp32_wifi_alarm_idf/
     ├── ring.[ch]           SPSC 字节 ring（无锁）
     ├── audio_io.[ch]       Core 1 上的 I2S 任务，复用 64 KB arena
     ├── voice_chat.[ch]     esp-tls chunked POST + body 直推 ring 播放
-    ├── wifi_creds.[ch]     SPIFFS /wifi_config.txt 读写
+    ├── wifi_creds.[ch]     当前 Wi-Fi 与历史网络 SPIFFS 读写
     ├── app_secret_store.[ch] SPIFFS /app_secrets.txt 读写
     ├── wifi_time.[ch]      esp_wifi STA + esp_http_client 取时
-    ├── wifi_provision.[ch] SoftAP + HTTP 配网页
+    ├── wifi_provision.[ch] API Key SoftAP + HTTP 配网页
     ├── buttons.[ch]        双确认按钮去抖 + X/Y ADC 摇杆方向
     ├── gui_app.h           App 描述符、输入和动作接口
     ├── gui_shell.[ch]      主导航、焦点路由和底部状态栏
@@ -355,7 +362,7 @@ esp32_wifi_alarm_idf/
     ├── app_radio.[ch]      网络电台列表与状态界面
     ├── radio_player.[ch]   Core 0 HTTP/MP3 解码 worker
     ├── radio_stations.[ch] 电台目录
-    ├── app_settings.[ch]   设置 App
+    ├── app_settings.[ch]   Wi-Fi/API 设置与屏幕虚拟键盘
     ├── st7789.[ch]         ST7789 TFT 驱动
     ├── font5x7.[ch]        ASCII 5x7 字体（475 B）
     ├── font_zh16.[ch]      GNU Unifont 16×16 字体访问层

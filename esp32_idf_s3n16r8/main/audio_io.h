@@ -27,6 +27,7 @@ typedef enum {
 } audio_phase_t;
 
 esp_err_t audio_io_init(void);
+esp_err_t audio_io_quiet_speaker_pins(void);
 
 esp_err_t audio_io_start_recording(uint32_t ack_timeout_ms);
 esp_err_t audio_io_stop_recording(uint32_t ack_timeout_ms);

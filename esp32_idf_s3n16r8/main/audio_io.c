@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <driver/gpio.h>
 #include <driver/i2s_std.h>
 
 static const char *TAG = "audio_io";
@@ -66,6 +67,23 @@ static bool              s_spk_installed;
 static TaskHandle_t      s_task;
 
 static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+esp_err_t audio_io_quiet_speaker_pins(void) {
+    const uint64_t pin_mask = (1ULL << APP_SPK_BCLK_PIN) |
+                              (1ULL << APP_SPK_LRCK_PIN) |
+                              (1ULL << APP_SPK_DATA_PIN);
+    gpio_set_level(APP_SPK_BCLK_PIN, 0);
+    gpio_set_level(APP_SPK_LRCK_PIN, 0);
+    gpio_set_level(APP_SPK_DATA_PIN, 0);
+    const gpio_config_t cfg = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
 
 static esp_err_t install_mic(void) {
     if (s_mic_installed) return ESP_OK;
@@ -139,9 +157,23 @@ static esp_err_t install_speaker(void) {
     if (channels == 1) std.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     err = i2s_channel_init_std_mode(s_spk_chan, &std);
     if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
+        audio_io_quiet_speaker_pins();
         ESP_LOGE(TAG, "spk init_std: %s", esp_err_to_name(err)); return err; }
     err = i2s_channel_enable(s_spk_chan);
-    if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL; return err; }
+    if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
+        audio_io_quiet_speaker_pins(); return err; }
+    memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
+    size_t silence_written = 0;
+    err = i2s_channel_write(s_spk_chan, s_i2s_write_buf,
+                            sizeof(s_i2s_write_buf), &silence_written,
+                            portMAX_DELAY);
+    if (err != ESP_OK || silence_written != sizeof(s_i2s_write_buf)) {
+        i2s_channel_disable(s_spk_chan);
+        i2s_del_channel(s_spk_chan);
+        s_spk_chan = NULL;
+        audio_io_quiet_speaker_pins();
+        return err != ESP_OK ? err : ESP_FAIL;
+    }
     s_spk_installed = true;
     mem_log("spk install");
     return ESP_OK;
@@ -153,6 +185,7 @@ static void uninstall_speaker(void) {
     i2s_del_channel(s_spk_chan);
     s_spk_chan = NULL;
     s_spk_installed = false;
+    audio_io_quiet_speaker_pins();
 }
 
 // --- Recording phase: reuse arena as mic ring; producer = audio task ----
@@ -257,6 +290,12 @@ static void do_playback(void) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 
+    // End with digital silence before releasing the I2S pins.
+    memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
+    size_t silence_written = 0;
+    i2s_channel_write(s_spk_chan, s_i2s_write_buf,
+                      sizeof(s_i2s_write_buf), &silence_written,
+                      portMAX_DELAY);
     // i2s_channel_write returns once data is queued; wait for DMA drain.
     vTaskDelay(pdMS_TO_TICKS(350));
     uninstall_speaker();
@@ -297,6 +336,11 @@ static void task_run(void *arg) {
 
 esp_err_t audio_io_init(void) {
     if (s_task) return ESP_OK;
+    esp_err_t err = audio_io_quiet_speaker_pins();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "speaker pin quiet: %s", esp_err_to_name(err));
+        return err;
+    }
     if (ring_init(&s_ring, s_arena, sizeof(s_arena)) != 0) {
         ESP_LOGE(TAG, "ring init failed");
         return ESP_FAIL;

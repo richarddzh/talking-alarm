@@ -28,7 +28,7 @@ static EventGroupHandle_t s_evt;
 static void event_handler(void *arg, esp_event_base_t base,
                           int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (wifi_time_has_credentials()) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disc =
             (const wifi_event_sta_disconnected_t *)data;
@@ -138,6 +138,88 @@ esp_err_t wifi_time_disconnect(void) {
     esp_wifi_stop();
     s_started = false;
     s_connected = false;
+    return ESP_OK;
+}
+
+esp_err_t wifi_time_scan(wifi_scan_ap_t *results, size_t capacity,
+                         size_t *count) {
+    if (!count || (capacity > 0 && !results)) return ESP_ERR_INVALID_ARG;
+    *count = 0;
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+
+    if (!s_started) {
+        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) return err;
+        err = esp_wifi_start();
+        if (err != ESP_OK) return err;
+        s_started = true;
+    }
+
+    wifi_scan_config_t scan = {
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err != ESP_OK) return err;
+
+    uint16_t found = 0;
+    err = esp_wifi_scan_get_ap_num(&found);
+    if (err != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        return err;
+    }
+    if (found == 0 || capacity == 0) {
+        esp_wifi_clear_ap_list();
+        return ESP_OK;
+    }
+
+    uint16_t fetch = found > 32 ? 32 : found;
+    wifi_ap_record_t *records = calloc(fetch, sizeof(*records));
+    if (!records) {
+        esp_wifi_clear_ap_list();
+        return ESP_ERR_NO_MEM;
+    }
+    err = esp_wifi_scan_get_ap_records(&fetch, records);
+    if (err != ESP_OK) {
+        free(records);
+        return err;
+    }
+
+    for (uint16_t i = 0; i < fetch; ++i) {
+        if (!records[i].ssid[0]) continue;
+        size_t existing = *count;
+        for (size_t j = 0; j < *count; ++j) {
+            if (strcmp(results[j].ssid, (const char *)records[i].ssid) == 0) {
+                existing = j;
+                break;
+            }
+        }
+        if (existing < *count) {
+            if (records[i].rssi > results[existing].rssi) {
+                results[existing].rssi = records[i].rssi;
+                results[existing].secured =
+                    records[i].authmode != WIFI_AUTH_OPEN;
+            }
+            continue;
+        }
+        if (*count >= capacity) continue;
+        snprintf(results[*count].ssid, sizeof(results[*count].ssid), "%s",
+                 (const char *)records[i].ssid);
+        results[*count].rssi = records[i].rssi;
+        results[*count].secured = records[i].authmode != WIFI_AUTH_OPEN;
+        (*count)++;
+    }
+    free(records);
+
+    for (size_t i = 1; i < *count; ++i) {
+        wifi_scan_ap_t item = results[i];
+        size_t j = i;
+        while (j > 0 && results[j - 1].rssi < item.rssi) {
+            results[j] = results[j - 1];
+            --j;
+        }
+        results[j] = item;
+    }
     return ESP_OK;
 }
 

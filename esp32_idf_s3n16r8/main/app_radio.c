@@ -1,5 +1,6 @@
 #include "app_radio.h"
 
+#include "app_config.h"
 #include "radio_player.h"
 #include "radio_stations.h"
 #include "ui_screen.h"
@@ -67,14 +68,15 @@ static void render(const gui_model_t *model, int focused_item) {
     radio_player_snapshot_t snapshot;
     radio_player_get_snapshot(&snapshot);
 
-    ui_draw_text(14, 8, "网络电台", 3, UI_COLOR_TEXT);
-    ui_draw_text(174, 13, state_label(snapshot.state), 2,
+    ui_fill_rect(0, 0, APP_UI_W, 32, UI_COLOR_NAVY);
+    ui_draw_text(12, 8, "网络电台", 2, UI_COLOR_TEXT);
+    ui_draw_text(174, 8, state_label(snapshot.state), 2,
                  snapshot.state == RADIO_PLAYER_ERROR
                      ? UI_COLOR_DANGER
                      : snapshot.state == RADIO_PLAYER_PLAYING
                            ? UI_COLOR_SUCCESS
                            : UI_COLOR_CYAN);
-    ui_draw_text(226, 13, snapshot.message, 1, UI_COLOR_MUTED);
+    ui_draw_text(226, 11, snapshot.message, 1, UI_COLOR_MUTED);
 
     size_t first = 0;
     if (focused_item >= RADIO_VISIBLE_ROWS) {

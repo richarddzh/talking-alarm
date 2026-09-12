@@ -6,11 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#define GRID_W 20
+#define GRID_W 19
 #define GRID_H 15
-#define CELL 10
-#define FIELD_X 8
-#define FIELD_Y 38
+#define CELL 12
+#define FIELD_X 4
+#define FIELD_Y 24
 #define SNAKE_CAPACITY 128
 #define MOVE_MS 220
 
@@ -135,7 +135,8 @@ static direction_t direction_between(point_t from, point_t to) {
 
 static void draw_body_block(int x, int y, direction_t toward_head,
                             direction_t toward_tail) {
-    ui_fill_circle(x + CELL / 2, y + CELL / 2, 4, UI_COLOR_SUCCESS);
+    ui_fill_circle(x + CELL / 2, y + CELL / 2,
+                   CELL / 2 - 1, UI_COLOR_SUCCESS);
     direction_t directions[2] = {toward_head, toward_tail};
     for (int i = 0; i < 2; ++i) {
         if (directions[i] == DIR_LEFT) {
@@ -150,9 +151,6 @@ static void draw_body_block(int x, int y, direction_t toward_head,
                          CELL - 4, CELL / 2, UI_COLOR_SUCCESS);
         }
     }
-    int dot_x = x + (toward_head == DIR_LEFT ? 3 : 7);
-    int dot_y = y + (toward_tail == DIR_UP ? 3 : 7);
-    ui_fill_circle(dot_x, dot_y, 2, UI_COLOR_DANGER);
 }
 
 static void draw_head(point_t point) {
@@ -160,23 +158,23 @@ static void draw_head(point_t point) {
     int y = FIELD_Y + point.y * CELL;
     ui_fill_round_rect(x, y, CELL, CELL, 4, UI_COLOR_SUCCESS);
     if (s_direction == DIR_LEFT || s_direction == DIR_RIGHT) {
-        int eye_x = s_direction == DIR_RIGHT ? x + 7 : x + 2;
+        int eye_x = s_direction == DIR_RIGHT ? x + CELL - 3 : x + 2;
         ui_fill_circle(eye_x, y + 3, 2, UI_COLOR_WHITE);
-        ui_fill_circle(eye_x, y + 7, 2, UI_COLOR_WHITE);
+        ui_fill_circle(eye_x, y + CELL - 4, 2, UI_COLOR_WHITE);
         ui_set_pixel(eye_x, y + 3, UI_COLOR_BLACK);
-        ui_set_pixel(eye_x, y + 7, UI_COLOR_BLACK);
+        ui_set_pixel(eye_x, y + CELL - 4, UI_COLOR_BLACK);
         int tongue_x = s_direction == DIR_RIGHT ? x + CELL + 2 : x - 3;
         ui_draw_line(s_direction == DIR_RIGHT ? x + CELL : x,
-                     y + 5, tongue_x, y + 5, UI_COLOR_DANGER);
+                     y + CELL / 2, tongue_x, y + CELL / 2, UI_COLOR_DANGER);
     } else {
-        int eye_y = s_direction == DIR_DOWN ? y + 7 : y + 2;
+        int eye_y = s_direction == DIR_DOWN ? y + CELL - 3 : y + 2;
         ui_fill_circle(x + 3, eye_y, 2, UI_COLOR_WHITE);
-        ui_fill_circle(x + 7, eye_y, 2, UI_COLOR_WHITE);
+        ui_fill_circle(x + CELL - 4, eye_y, 2, UI_COLOR_WHITE);
         ui_set_pixel(x + 3, eye_y, UI_COLOR_BLACK);
-        ui_set_pixel(x + 7, eye_y, UI_COLOR_BLACK);
+        ui_set_pixel(x + CELL - 4, eye_y, UI_COLOR_BLACK);
         int tongue_y = s_direction == DIR_DOWN ? y + CELL + 2 : y - 3;
-        ui_draw_line(x + 5, s_direction == DIR_DOWN ? y + CELL : y,
-                     x + 5, tongue_y, UI_COLOR_DANGER);
+        ui_draw_line(x + CELL / 2, s_direction == DIR_DOWN ? y + CELL : y,
+                     x + CELL / 2, tongue_y, UI_COLOR_DANGER);
     }
 }
 
@@ -185,21 +183,27 @@ static void draw_tail(point_t point, direction_t toward_head) {
     int y = FIELD_Y + point.y * CELL;
     ui_fill_round_rect(x + 2, y + 2, CELL - 4, CELL - 4, 3, UI_COLOR_SUCCESS);
     if (toward_head == DIR_LEFT || toward_head == DIR_RIGHT) {
-        ui_fill_triangle(toward_head == DIR_RIGHT ? x + 8 : x + 2, y + 2,
-                         toward_head == DIR_RIGHT ? x + 8 : x + 2, y + 8,
-                         toward_head == DIR_RIGHT ? x + 1 : x + 9, y + 5,
+        ui_fill_triangle(toward_head == DIR_RIGHT ? x + CELL - 2 : x + 2,
+                         y + 2,
+                         toward_head == DIR_RIGHT ? x + CELL - 2 : x + 2,
+                         y + CELL - 2,
+                         toward_head == DIR_RIGHT ? x + 1 : x + CELL - 1,
+                         y + CELL / 2,
                          UI_COLOR_SUCCESS);
     } else {
-        ui_fill_triangle(x + 2, toward_head == DIR_DOWN ? y + 8 : y + 2,
-                         x + 8, toward_head == DIR_DOWN ? y + 8 : y + 2,
-                         x + 5, toward_head == DIR_DOWN ? y + 1 : y + 9,
+        ui_fill_triangle(x + 2,
+                         toward_head == DIR_DOWN ? y + CELL - 2 : y + 2,
+                         x + CELL - 2,
+                         toward_head == DIR_DOWN ? y + CELL - 2 : y + 2,
+                         x + CELL / 2,
+                         toward_head == DIR_DOWN ? y + 1 : y + CELL - 1,
                          UI_COLOR_SUCCESS);
     }
 }
 
 static void render(const gui_model_t *model, int focused_item) {
     (void)model;
-    ui_draw_text(10, 8, "贪吃蛇", 2, UI_COLOR_TEXT);
+    ui_draw_text(6, 5, "贪吃蛇", 2, UI_COLOR_TEXT);
     ui_fill_rect(FIELD_X, FIELD_Y, GRID_W * CELL,
                  GRID_H * CELL, UI_COLOR_BLACK);
     ui_draw_rect(FIELD_X - 2, FIELD_Y - 2,
@@ -208,8 +212,8 @@ static void render(const gui_model_t *model, int focused_item) {
 
     int apple_x = FIELD_X + s_apple.x * CELL + CELL / 2;
     int apple_y = FIELD_Y + s_apple.y * CELL + CELL / 2;
-    ui_fill_circle(apple_x, apple_y, 4, UI_COLOR_DANGER);
-    ui_draw_line(apple_x, apple_y - 4, apple_x + 2, apple_y - 7,
+    ui_fill_circle(apple_x, apple_y, 5, UI_COLOR_DANGER);
+    ui_draw_line(apple_x, apple_y - 5, apple_x + 2, apple_y - 8,
                  UI_COLOR_SUCCESS);
 
     if (s_length > 0) {
@@ -231,18 +235,19 @@ static void render(const gui_model_t *model, int focused_item) {
     }
 
     char score[24];
-    ui_draw_text(224, 42, "苹果", 2, UI_COLOR_MUTED);
+    ui_draw_text(242, 44, "苹果", 1, UI_COLOR_MUTED);
     snprintf(score, sizeof(score), "%d", s_score / 10);
-    ui_draw_text(244, 68, score, 3, UI_COLOR_FOCUS);
-    ui_fill_round_rect(222, 116, 88, 36, 7,
+    ui_draw_text(244, 60, score, 2, UI_COLOR_FOCUS);
+    ui_fill_round_rect(239, 5, 74, 28, 5,
                        focused_item == 0 ? UI_COLOR_PRIMARY_DARK
                                          : UI_COLOR_PANEL);
-    ui_draw_rect(222, 116, 88, 36, focused_item == 0 ? 3 : 1,
+    ui_draw_rect(239, 5, 74, 28, focused_item == 0 ? 3 : 1,
                  focused_item == 0 ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-    ui_draw_text(238, 127, s_running ? "重开" : "开始", 2,
+    ui_draw_text(260, 15, s_running ? "重开" : "开始", 1,
                  focused_item == 0 ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     if (s_game_over) {
-        ui_draw_text(224, 170, "游戏结束", 2, UI_COLOR_DANGER);
+        ui_draw_text(240, 154, "游戏", 1, UI_COLOR_DANGER);
+        ui_draw_text(240, 168, "结束", 1, UI_COLOR_DANGER);
     }
 }
 
