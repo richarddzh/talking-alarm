@@ -16,6 +16,8 @@ static size_t s_app_count;
 static size_t s_current_app;
 static int s_focus = GUI_FOCUS_HOME;
 static bool s_launcher;
+static bool s_launcher_icons_drawn;
+static int s_launcher_icons_focus = GUI_FOCUS_HOME;
 
 static void draw_centered_text(int center_x, int y, const char *text,
                                uint8_t size, ui_color_t color) {
@@ -76,26 +78,6 @@ static void draw_status_bar(const gui_model_t *model) {
                    model->wifi_connected || model->setup_mode);
 }
 
-static void draw_icon(gui_icon_t icon, int x, int y) {
-    if ((size_t)icon >= sizeof(s_launcher_icon_pixels) /
-                        sizeof(s_launcher_icon_pixels[0])) {
-        icon = GUI_ICON_CHAT;
-    }
-    const uint8_t *pixels = s_launcher_icon_pixels[icon];
-    const ui_color_t *palette = s_launcher_icon_palettes[icon];
-    for (int row = 0; row < LAUNCHER_ICON_H; ++row) {
-        for (int column = 0; column < LAUNCHER_ICON_W; ++column) {
-            int pixel_index = row * LAUNCHER_ICON_W + column;
-            uint8_t packed = pixels[pixel_index / 2];
-            uint8_t color_index = (pixel_index & 1)
-                                      ? packed & 0x0f : packed >> 4;
-            if (color_index == 0) continue;
-            ui_fill_rect(x + column * 2, y + row * 2, 2, 2,
-                         palette[color_index]);
-        }
-    }
-}
-
 static void render_launcher(void) {
     ui_fill_rect(0, 0, APP_UI_W, 32, UI_COLOR_NAVY);
     ui_draw_text(12, 8, "应用", 2, UI_COLOR_TEXT);
@@ -115,10 +97,39 @@ static void render_launcher(void) {
                      selected ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL);
         ui_draw_rect(x, y, card_w, card_h, selected ? 4 : 2,
                      selected ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-        draw_icon(s_apps[i]->icon, x + 23, y + 2);
         draw_centered_text(x + card_w / 2, y + 53, s_apps[i]->label,
                            1, selected ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     }
+}
+
+static esp_err_t draw_launcher_icons(void) {
+    const int card_w = 94;
+    const int card_h = 70;
+    const int gap = 9;
+    for (size_t i = 0; i < s_app_count; ++i) {
+        int column = (int)(i % 3);
+        int row = (int)(i / 3);
+        int x = 9 + column * (card_w + gap);
+        int y = 50 + row * (card_h + 3);
+        if (y + card_h > CONTENT_BOTTOM) break;
+
+        gui_icon_t icon = s_apps[i]->icon;
+        if ((size_t)icon >= sizeof(s_launcher_icon_rgb565) /
+                            sizeof(s_launcher_icon_rgb565[0])) {
+            icon = GUI_ICON_CHAT;
+        }
+        ui_color_t background = s_focus == (int)i
+                                    ? UI_COLOR_PRIMARY_DARK
+                                    : UI_COLOR_PANEL;
+        esp_err_t err = ui_draw_rgb565_bitmap(
+            x + (card_w - LAUNCHER_ICON_W) / 2, y + 4,
+            LAUNCHER_ICON_W, LAUNCHER_ICON_H,
+            s_launcher_icon_rgb565[icon],
+            s_launcher_icon_alpha[icon],
+            background);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
 }
 
 void gui_shell_init(const gui_app_t *const *apps, size_t app_count,
@@ -215,6 +226,10 @@ gui_action_t gui_shell_tick(int64_t now_ms) {
 }
 
 void gui_shell_render(const gui_model_t *model) {
+    if (!s_launcher && s_launcher_icons_drawn) {
+        ui_invalidate();
+        s_launcher_icons_drawn = false;
+    }
     ui_begin(UI_COLOR_BG);
     if (s_launcher) {
         render_launcher();
@@ -222,7 +237,17 @@ void gui_shell_render(const gui_model_t *model) {
         s_apps[s_current_app]->render(model, s_focus);
     }
     draw_status_bar(model);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ui_flush());
+    esp_err_t err = ui_flush();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(err);
+    if (err == ESP_OK && s_launcher &&
+        (!s_launcher_icons_drawn || s_launcher_icons_focus != s_focus)) {
+        err = draw_launcher_icons();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(err);
+        if (err == ESP_OK) {
+            s_launcher_icons_drawn = true;
+            s_launcher_icons_focus = s_focus;
+        }
+    }
 }
 
 bool gui_shell_is_launcher(void) {

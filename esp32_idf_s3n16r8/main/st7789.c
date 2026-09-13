@@ -146,3 +146,47 @@ esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
     }
     return ESP_OK;
 }
+
+static uint16_t blend_rgb565(uint16_t foreground, uint16_t background,
+                             uint8_t alpha) {
+    if (alpha == 0) return background;
+    if (alpha == UINT8_MAX) return foreground;
+
+    uint32_t inverse = UINT8_MAX - alpha;
+    uint32_t red = (((foreground >> 11) & 0x1F) * alpha +
+                    ((background >> 11) & 0x1F) * inverse + 127) / 255;
+    uint32_t green = (((foreground >> 5) & 0x3F) * alpha +
+                      ((background >> 5) & 0x3F) * inverse + 127) / 255;
+    uint32_t blue = ((foreground & 0x1F) * alpha +
+                     (background & 0x1F) * inverse + 127) / 255;
+    return (uint16_t)((red << 11) | (green << 5) | blue);
+}
+
+esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
+                                    const uint16_t *pixels,
+                                    const uint8_t *alpha,
+                                    uint16_t background) {
+    if (!pixels || !alpha || x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        width > APP_TFT_W || x + width > APP_TFT_W ||
+        y + height > APP_TFT_H) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = set_window(x, y, width, height);
+    if (err != ESP_OK) return err;
+
+    for (int row = 0; row < height; ++row) {
+        size_t row_offset = (size_t)row * width;
+        for (int column = 0; column < width; ++column) {
+            size_t pixel = row_offset + column;
+            uint16_t color = blend_rgb565(
+                pixels[pixel], background, alpha[pixel]);
+            color = (uint16_t)~color;
+            s_line[column * 2] = color >> 8;
+            s_line[column * 2 + 1] = color;
+        }
+        err = transmit(true, s_line, (size_t)width * 2);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}

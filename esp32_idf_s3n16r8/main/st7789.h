@@ -15,3 +15,10 @@ esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
                                       int framebuffer_width,
                                       int x, int y, int width, int height,
                                       const uint16_t palette[16]);
+
+// Draws a logical RGB565 bitmap, blending its 8-bit alpha channel over a
+// solid logical RGB565 background before applying the panel color polarity.
+esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
+                                    const uint16_t *pixels,
+                                    const uint8_t *alpha,
+                                    uint16_t background);

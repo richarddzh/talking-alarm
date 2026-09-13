@@ -40,6 +40,11 @@ void ui_draw_text(int x, int y, const char *text,
                   uint8_t size, ui_color_t color);
 int ui_text_width(const char *text, uint8_t size);
 esp_err_t ui_flush(void);
+void ui_invalidate(void);
+esp_err_t ui_draw_rgb565_bitmap(int x, int y, int width, int height,
+                                const uint16_t *pixels,
+                                const uint8_t *alpha,
+                                ui_color_t background);
 
 // Big clock face with date on top, large HH:MM in middle, small SS on
 // the right, and two small footer lines.

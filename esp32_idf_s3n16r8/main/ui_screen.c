@@ -324,6 +324,23 @@ esp_err_t ui_flush(void) {
     return ESP_OK;
 }
 
+void ui_invalidate(void) {
+    s_previous_valid = false;
+}
+
+esp_err_t ui_draw_rgb565_bitmap(int x, int y, int width, int height,
+                                const uint16_t *pixels,
+                                const uint8_t *alpha,
+                                ui_color_t background) {
+    if ((unsigned)background >=
+        sizeof(s_palette) / sizeof(s_palette[0])) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return st7789_draw_rgb565_bitmap(
+        x, y, width, height, pixels, alpha,
+        (uint16_t)~s_palette[background]);
+}
+
 esp_err_t ui_init(void) {
     s_framebuffer = heap_caps_calloc(
         1, FRAMEBUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
