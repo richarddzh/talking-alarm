@@ -31,6 +31,9 @@ typedef enum {
 typedef struct {
     doubao_tts_status_cb_t status_cb;
     void *status_ctx;
+    doubao_tts_cancel_cb_t cancel_cb;
+    void *cancel_ctx;
+    bool cancelled;
     tts_parse_state_t state;
     size_t key_match;
     size_t null_match;
@@ -43,8 +46,16 @@ typedef struct {
     int status_code;
 } tts_stream_ctx_t;
 
+static bool is_cancelled(void *arg) {
+    tts_stream_ctx_t *ctx = arg;
+    if (audio_io_is_suspended() || (ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_ctx))) {
+        ctx->cancelled = true;
+    }
+    return ctx->cancelled;
+}
+
 static void report_status(tts_stream_ctx_t *ctx, const char *msg) {
-    if (ctx->status_cb) ctx->status_cb(ctx->status_ctx, msg);
+    if (!is_cancelled(ctx) && ctx->status_cb) ctx->status_cb(ctx->status_ctx, msg);
 }
 
 static void make_connect_id(char out[37]) {
@@ -101,9 +112,10 @@ static char *json_escape_alloc(const char *src) {
 }
 
 static esp_err_t maybe_start_playback(tts_stream_ctx_t *ctx, bool force) {
+    if (is_cancelled(ctx)) return ESP_ERR_INVALID_STATE;
     if (!ctx->playback_started && ctx->total_pcm > 0 &&
         (force || ctx->total_pcm >= TTS_PREFILL_BYTES)) {
-        if (audio_io_start_playback(1000) != ESP_OK) return ESP_FAIL;
+        if (audio_io_start_playback_cancellable(1000, is_cancelled, ctx) != ESP_OK) return ESP_FAIL;
         ctx->playback_started = true;
         report_status(ctx, "playing tts");
     }
@@ -113,6 +125,7 @@ static esp_err_t maybe_start_playback(tts_stream_ctx_t *ctx, bool force) {
 static esp_err_t push_pcm(tts_stream_ctx_t *ctx, const uint8_t *pcm, size_t len) {
     size_t off = 0;
     while (off < len) {
+        if (is_cancelled(ctx)) return ESP_ERR_INVALID_STATE;
         size_t pushed = audio_io_write_speaker(pcm + off, len - off,
                                                TTS_PUSH_TIMEOUT_MS);
         if (pushed == 0) {
@@ -163,6 +176,7 @@ static esp_err_t feed_tts_json(tts_stream_ctx_t *ctx, const char *data, size_t l
     static const char nullv[] = "null";
 
     for (size_t i = 0; i < len; ++i) {
+        if (is_cancelled(ctx)) return ESP_ERR_INVALID_STATE;
         char c = data[i];
         switch (ctx->state) {
         case PARSE_SEARCH_KEY:
@@ -233,10 +247,15 @@ static esp_err_t finish_tts_json(tts_stream_ctx_t *ctx) {
 static esp_err_t tts_http_event(esp_http_client_event_t *e) {
     tts_stream_ctx_t *ctx = (tts_stream_ctx_t *)e->user_data;
     if (!ctx) return ESP_OK;
+    if (is_cancelled(ctx)) {
+        ctx->stream_error = true;
+        return ESP_FAIL;
+    }
 
     switch (e->event_id) {
     case HTTP_EVENT_ON_CONNECTED:
-        if (audio_io_prepare_speaker(APP_DOUBAO_TTS_SAMPLE_RATE, 1) != ESP_OK) {
+        if (audio_io_prepare_speaker_cancellable(APP_DOUBAO_TTS_SAMPLE_RATE, 1,
+                                                 is_cancelled, ctx) != ESP_OK) {
             ctx->stream_error = true;
             return ESP_FAIL;
         }
@@ -260,8 +279,23 @@ static esp_err_t tts_http_event(esp_http_client_event_t *e) {
 esp_err_t doubao_tts_play_text(const char *text,
                                doubao_tts_status_cb_t status_cb,
                                void *status_ctx) {
+    return doubao_tts_play_text_cancellable(text, status_cb, status_ctx, NULL, NULL);
+}
+
+esp_err_t doubao_tts_play_text_cancellable(const char *text,
+                                           doubao_tts_status_cb_t status_cb,
+                                           void *status_ctx,
+                                           doubao_tts_cancel_cb_t cancel_cb,
+                                           void *cancel_ctx) {
     if (!text || text[0] == 0) return ESP_ERR_INVALID_ARG;
     if (!app_secrets_ready()) return ESP_ERR_INVALID_STATE;
+    tts_stream_ctx_t ctx = {
+        .status_cb = status_cb,
+        .status_ctx = status_ctx,
+        .cancel_cb = cancel_cb,
+        .cancel_ctx = cancel_ctx,
+    };
+    if (is_cancelled(&ctx)) return ESP_ERR_INVALID_STATE;
 
     char *escaped_text = json_escape_alloc(text);
     if (!escaped_text) return ESP_ERR_NO_MEM;
@@ -287,10 +321,6 @@ esp_err_t doubao_tts_play_text(const char *text,
              APP_DOUBAO_TTS_SPEAKER, APP_DOUBAO_TTS_SAMPLE_RATE);
     free(escaped_text);
 
-    tts_stream_ctx_t ctx = {
-        .status_cb = status_cb,
-        .status_ctx = status_ctx,
-    };
     char connect_id[37];
     make_connect_id(connect_id);
 
@@ -317,11 +347,16 @@ esp_err_t doubao_tts_play_text(const char *text,
     esp_http_client_set_post_field(cli, body, body_len);
 
     report_status(&ctx, "tts connect");
-    esp_err_t err = esp_http_client_perform(cli);
+    esp_err_t err = is_cancelled(&ctx) ? ESP_ERR_INVALID_STATE :
+                    esp_http_client_perform(cli);
     int code = esp_http_client_get_status_code(cli);
     esp_http_client_cleanup(cli);
     free(body);
 
+    if (is_cancelled(&ctx)) {
+        audio_io_abort(2000);
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t finish_err = finish_tts_json(&ctx);
     if (err != ESP_OK || ctx.stream_error || finish_err != ESP_OK || code != 200) {
         if (ctx.playback_started) {
@@ -340,6 +375,7 @@ esp_err_t doubao_tts_play_text(const char *text,
         audio_io_abort(2000);
         return ESP_FAIL;
     }
+    if (is_cancelled(&ctx)) return ESP_ERR_INVALID_STATE;
     ctx.playback_started = false;
     ESP_LOGI(TAG, "played %u bytes underrun=%u",
              (unsigned)ctx.total_pcm, (unsigned)audio_io_spk_underrun());

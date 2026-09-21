@@ -1,6 +1,7 @@
 #include "app_settings.h"
 
 #include "app_config.h"
+#include "power_settings.h"
 #include "ui_screen.h"
 #include "wifi_creds.h"
 #include "wifi_time.h"
@@ -31,6 +32,8 @@ typedef enum {
 } keyboard_mode_t;
 
 static settings_page_t s_page;
+static int s_root_scroll;
+static char s_power_status[48];
 static wifi_creds_t s_profiles[WIFI_CREDS_MAX_PROFILES];
 static size_t s_profile_count;
 static wifi_scan_ap_t s_scan[WIFI_SCAN_MAX_RESULTS];
@@ -73,21 +76,46 @@ static void draw_row(int y, const char *label, const char *value,
 static void render_root(const gui_model_t *model, int focused_item) {
     ui_fill_rect(0, 0, APP_UI_W, 32, UI_COLOR_NAVY);
     ui_draw_text(12, 8, "设置", 2, UI_COLOR_TEXT);
-    ui_draw_text(18, 38, "设备控制", 1, UI_COLOR_MUTED);
+    ui_draw_text(18, 34, s_power_status[0] ? s_power_status : "设备控制",
+                 1, s_power_status[0] ? UI_COLOR_WARNING : UI_COLOR_MUTED);
 
-    draw_row(51, "安静模式", model->quiet_mode ? "开启" : "关闭",
-             focused_item == 0,
-             model->quiet_mode ? UI_COLOR_WARNING : UI_COLOR_SUCCESS);
-    draw_row(89, "WiFi 设置",
-             model->wifi_connected ? "已连接" :
-             (model->wifi_configured ? "已保存" : "未设置"),
-             focused_item == 1,
-             model->wifi_connected ? UI_COLOR_SUCCESS : UI_COLOR_MUTED);
-    draw_row(127, "API 设置", model->setup_mode ? "配置中" : "网页",
-             focused_item == 2,
-             model->setup_mode ? UI_COLOR_WARNING : UI_COLOR_CYAN);
-    draw_row(165, "时间同步", "执行",
-             focused_item == 3, UI_COLOR_CYAN);
+    if (focused_item >= 0) {
+        if (focused_item < s_root_scroll) s_root_scroll = focused_item;
+        if (focused_item >= s_root_scroll + 4) s_root_scroll = focused_item - 3;
+    }
+    const power_settings_t *settings = power_settings_get();
+    char sleep_value[20] = "永远不";
+    char screen_value[20] = "永远不";
+    if (settings->sleep_minutes) {
+        snprintf(sleep_value, sizeof(sleep_value), "%u分钟",
+                 (unsigned)settings->sleep_minutes);
+    }
+    if (settings->screen_off_minutes) {
+        snprintf(screen_value, sizeof(screen_value), "%u分钟",
+                 (unsigned)settings->screen_off_minutes);
+    }
+    const char *labels[] = {
+        "安静模式", "WiFi 设置", "API 设置", "时间同步", "自动休眠", "自动息屏",
+    };
+    const char *values[] = {
+        model->quiet_mode ? "开启" : "关闭",
+        model->wifi_connected ? "已连接" :
+            (model->wifi_configured ? "已保存" : "未设置"),
+        model->setup_mode ? "配置中" : "网页", "执行", sleep_value, screen_value,
+    };
+    const ui_color_t colors[] = {
+        model->quiet_mode ? UI_COLOR_WARNING : UI_COLOR_SUCCESS,
+        model->wifi_connected ? UI_COLOR_SUCCESS : UI_COLOR_MUTED,
+        model->setup_mode ? UI_COLOR_WARNING : UI_COLOR_CYAN,
+        UI_COLOR_CYAN, UI_COLOR_CYAN, UI_COLOR_CYAN,
+    };
+    for (int row = 0; row < 4; ++row) {
+        int item = s_root_scroll + row;
+        draw_row(51 + row * 38, labels[item], values[item],
+                 focused_item == item, colors[item]);
+    }
+    if (s_root_scroll > 0) ui_draw_text(305, 55, "^", 1, UI_COLOR_MUTED);
+    if (s_root_scroll < 2) ui_draw_text(305, 190, "v", 1, UI_COLOR_MUTED);
 }
 
 static bool scan_is_saved(size_t scan_index) {
@@ -471,6 +499,25 @@ static gui_action_t activate(uint8_t item) {
         return GUI_ACTION_API_SETUP_START;
     case 3:
         return GUI_ACTION_SYNC_TIME;
+    case 4:
+    case 5: {
+        static const uint32_t sleep_options[] = {0, 5, 10, 30};
+        static const uint32_t screen_options[] = {0, 1, 5, 10};
+        power_settings_t settings = *power_settings_get();
+        const uint32_t *options = item == 4 ? sleep_options : screen_options;
+        uint32_t *value = item == 4 ? &settings.sleep_minutes :
+                                      &settings.screen_off_minutes;
+        for (size_t i = 0; i < 4; ++i) {
+            if (*value == options[i]) {
+                *value = options[(i + 1) % 4];
+                break;
+            }
+        }
+        snprintf(s_power_status, sizeof(s_power_status), "%s",
+                 power_settings_save(&settings) == ESP_OK ?
+                     "已保存，按确认切换" : "保存失败，设置未更改");
+        return GUI_ACTION_REDRAW;
+    }
     default:
         return GUI_ACTION_NONE;
     }
@@ -535,6 +582,8 @@ static bool handle_input(gui_input_t input, gui_action_t *action) {
 
 static void enter(void) {
     s_page = SETTINGS_PAGE_ROOT;
+    s_root_scroll = 0;
+    s_power_status[0] = 0;
     load_profiles();
 }
 
@@ -546,14 +595,18 @@ static const gui_focus_node_t s_focus_grid[] = {
     {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
      .up = 1, .down = 3},
     {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
-     .up = 2, .down = GUI_FOCUS_HOME},
+     .up = 2, .down = 4},
+    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
+     .up = 3, .down = 5},
+    {.left = GUI_FOCUS_NONE, .right = GUI_FOCUS_NONE,
+     .up = 4, .down = GUI_FOCUS_HOME},
 };
 
 static const gui_app_t s_app = {
     .id = "settings",
     .label = "设置",
     .icon = GUI_ICON_SETTINGS,
-    .focus_count = 4,
+    .focus_count = 6,
     .focus_grid = s_focus_grid,
     .enter = enter,
     .exit = NULL,

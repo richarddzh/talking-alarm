@@ -24,6 +24,7 @@ typedef enum {
     AUDIO_PHASE_IDLE = 0,
     AUDIO_PHASE_REC  = 1,
     AUDIO_PHASE_PLAY = 2,
+    AUDIO_PHASE_STARTING = 3,
 } audio_phase_t;
 
 esp_err_t audio_io_init(void);
@@ -34,7 +35,28 @@ esp_err_t audio_io_stop_recording(uint32_t ack_timeout_ms);
 esp_err_t audio_io_start_playback(uint32_t ack_timeout_ms);
 esp_err_t audio_io_stop_playback(uint32_t ack_timeout_ms);
 void      audio_io_abort(uint32_t timeout_ms);
+// Nonblocking: the audio task owns I2S teardown. IDLE acknowledges teardown,
+// including a pending start. Aborted ring contents cannot be reused.
+void      audio_io_request_abort(void);
+// Immediately close the I/O gate and request abort; never waits for DMA/network.
+// Unsuspending does not revive aborted audio. Before opening for a chime, wait
+// for all cancelled producers AND audio_io_phase() == AUDIO_PHASE_IDLE.
+void      audio_io_set_suspended(bool suspended);
+bool      audio_io_is_suspended(void);
 esp_err_t audio_io_prepare_speaker(uint32_t sample_rate, uint8_t channels);
+
+// Checked atomically with admission, under the audio control lock. Callback
+// must only read/latch cancellation flags: no blocking or mutating audio calls.
+typedef bool (*audio_io_cancel_cb_t)(void *ctx);
+esp_err_t audio_io_start_recording_cancellable(uint32_t ack_timeout_ms,
+                                               audio_io_cancel_cb_t cancelled,
+                                               void *ctx);
+esp_err_t audio_io_start_playback_cancellable(uint32_t ack_timeout_ms,
+                                              audio_io_cancel_cb_t cancelled,
+                                              void *ctx);
+esp_err_t audio_io_prepare_speaker_cancellable(uint32_t sample_rate, uint8_t channels,
+                                               audio_io_cancel_cb_t cancelled,
+                                               void *ctx);
 
 // Main-side I/O. Block up to timeout_ms (0 = non-blocking).
 size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms);

@@ -1,0 +1,28 @@
+用户需求（2026-09-20）：
+
+请你添加一个屏幕自动休眠功能，主要是为了省电
+
+在设置里面增加2个选项，
+
+自动休眠：永远不、5分钟、10分钟、30分钟
+
+自动息屏：永远不、1分钟、5分钟、10分钟
+
+设置存储在文件系统中
+
+休眠的意思是：停止播放和采集任何声音、退出游戏，仅保留整点报时能力
+
+息屏的意思是：继续播放声音（比如电台）、退出任何游戏、保留整点报时能力
+
+唤醒休眠/息屏：用户任何按钮或者摇杆动作
+
+用户补充：
+build应该使用powershell，环境：powershell.exe -NoExit -ExecutionPolicy Bypass -NoProfile -Command "& {. 'C:\\\\Espressif\\\\tools\\\\Microsoft.v5.3.5.PowerShell\_profile.ps1' }"
+
+用户澄清：
+不一定，我就是告诉你构建的环境在哪里
+
+用户操作请求（2026-09-21）：
+flash 到com6
+
+完成后，git commit push to remote main

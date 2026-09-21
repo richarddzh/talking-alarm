@@ -274,6 +274,10 @@ static const gui_focus_node_t s_focus_grid[] = {
      .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
 };
 
+static void exit_game(void) {
+    s_running = false;
+}
+
 static const gui_app_t s_app = {
     .id = "snake",
     .label = "贪吃蛇",
@@ -281,7 +285,7 @@ static const gui_app_t s_app = {
     .focus_count = 1,
     .focus_grid = s_focus_grid,
     .enter = NULL,
-    .exit = NULL,
+    .exit = exit_game,
     .tick = tick,
     .render = render,
     .activate = activate,

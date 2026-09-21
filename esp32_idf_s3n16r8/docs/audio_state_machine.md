@@ -7,8 +7,8 @@
 
 | 执行上下文 | Core | 主要职责 |
 |---|---:|---|
-| `app_main` | 0 | 按钮手势、录音期间泵送、RTC/UI、Wi-Fi 重连、报时调度和业务互斥 |
-| `voice_worker` | 0 | 停止录音、提交 ASR 尾帧、获取 Agent 回复、同步执行 TTS 播放 |
+| `app_main` | 0 | 按钮手势、录音状态检查、RTC/UI、Wi-Fi 重连、报时调度和休眠互斥 |
+| `voice_worker` | 0 | 建立 ASR、泵送录音、停止录音、提交 ASR 尾帧、获取 Agent 回复、同步执行 TTS 播放 |
 | `chime_worker` | 0 | 获取随机/整点 Agent 文本、同步执行 TTS 播放 |
 | `audio_io` | 1 | I2S 麦克风采集、32→16 kHz 转换、扬声器 DMA 写入和设备安装/卸载 |
 
@@ -20,9 +20,10 @@ I2S channel，只通过 `audio_io` 请求切换阶段和读写 SPSC ring。
 
 ### 主循环状态
 
-- `s_voice_recording`：主循环是否应继续调用 `voice_chat_pump()`。
+- `app_chat_alarm_is_recording()`：GUI 是否仍在等待录音结束；
+  `voice_chat_pump()` 仅做健康状态检查，不在主循环执行网络 I/O。
 - `s_setup_mode`：配置模式下跳过语音、自动 chime、RTC 刷新和 STA 重连。
-- `audio_activity_busy()`：统一检查 voice、chime 和 `audio_io_phase()`，
+- `audio_activity_busy()`：统一检查 voice、chime、radio 和 `audio_io_phase()`，
   音频活动期间禁止自动联网重试和网络校时。
 
 按钮长按启动语音前还会再次检查：
@@ -30,6 +31,7 @@ I2S channel，只通过 `audio_io` 请求切换阶段和读写 SPSC ring。
 ```text
 voice_chat_busy() == false
 chime_player_busy() == false
+radio_player_busy() == false
 audio_io_phase() == IDLE
 ```
 
@@ -52,18 +54,19 @@ IDLE/DONE/ERROR
   -> CONNECTING -> WAITING_REPLY -> PLAYING -> DRAINING -> DONE
 ```
 
-`DONE` 和 `ERROR` 是终态但不算 busy，下一次操作可以直接覆盖为新的
-`CONNECTING`。状态变量为跨任务读取的 `volatile` 枚举；worker 更新状态
+`DONE` 和 `ERROR` 是终态；是否允许新请求必须使用 busy API，不能仅看显示状态。
+取消期间 busy 一直保留到 worker 完成资源清理。worker 更新状态
 和消息后，通过 callback 设置主循环的 dirty 标志，由主循环统一刷新 TFT。
 
 ### `audio_io` 阶段
 
 ```text
-IDLE -> REC  -> IDLE
-IDLE -> PLAY -> IDLE
+IDLE -> STARTING -> REC  -> IDLE
+IDLE -> STARTING -> PLAY -> IDLE
 ```
 
-- `REC`：Core 1 是 mic ring 生产者，`app_main`/`voice_worker` 是消费者。
+- `STARTING`：启动请求已被接受或正在安装 I2S，不可误判为可复用的 IDLE。
+- `REC`：Core 1 是 mic ring 生产者，`voice_worker` 是消费者。
 - `PLAY`：TTS 所在的 Core 0 worker 是 speaker ring 生产者，Core 1 是消费者。
 - REC 和 PLAY 不重叠；同一块 64 KB arena 按 `MIC`/`SPK` role 复用。
 - 录音开始时重置 ring 并设置为 `MIC`；TTS 连接建立后显式清空 ring 并设置
@@ -72,14 +75,13 @@ IDLE -> PLAY -> IDLE
 
 ## 语音完整时序
 
-1. 长按达到 800 ms，主循环调用 `voice_chat_start()`。
-2. Core 0 同步建立豆包 ASR 会话，再请求 Core 1 进入 `REC`。
+1. 长按达到 800 ms，主循环调用 `voice_chat_start()`，异步接受请求后立即返回。
+2. `voice_worker` 建立豆包 ASR 会话，再请求 Core 1 进入 `REC`。
 3. `audio_io` 安装麦克风、清空 arena、确认 `REC`；启动函数收到确认后，
    Voice 才进入 `RECORDING`。
-4. 主循环仅在 `s_voice_recording` 为 true 时读取 mic ring 并发送 ASR 音频。
-5. 松开或达到 10 秒上限后，主循环先清除 `s_voice_recording`，再把 Voice
-   切到 `UPLOADING` 并唤醒 `voice_worker`，因此主循环不会和 worker 同时
-   使用 `s_io_buf` 或 ASR session。
+4. worker 读取 mic ring 并发送 ASR 音频，主循环继续处理输入和空闲计时。
+5. 松开或达到 10 秒上限后，主循环清除 GUI 录音状态并请求停止；
+   CONNECTING 期间也接受停止请求。ASR session 始终由 worker 独占。
 6. worker 请求 Core 1 停止录音，等待 I2S 卸载和 `IDLE` 确认，然后排空
    mic ring 并发送最终 ASR 帧。
 7. ASR 文本经过 Agent 后进入 TTS。TTS 先把 arena 切成 speaker role 并
@@ -94,7 +96,8 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
 套 speaker role、预填充、PLAY 和排空逻辑。
 
 主循环在启动 chime 前检查 Voice、Chime 和底层 phase，因此手动 chime、
-自动随机发言和整点报时不会打断录音或已有播放。当前没有音频任务队列：
+自动随机发言通常不会打断录音或已有播放。息屏期间的整点调度会先非阻塞地
+停止电台，等待清理完成后报时，再恢复原台。当前没有音频任务队列：
 手动触发遇到 busy 会直接失败；自动调度是否重试由 chime 调度器决定。
 
 ## 超时和错误恢复
@@ -111,6 +114,22 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
   检查会继续阻止新的语音、chime、联网校时和自动重连，避免共享 arena
   被再次使用。此类状态需要通过日志诊断或重启恢复。
 
+## 自动休眠的取消边界
+
+主循环进入休眠时先调用 `audio_io_set_suspended(true)`，再请求
+`voice_chat_cancel()`、`chime_player_cancel()` 和 `radio_player_request_stop()`。
+这些 API 均非阻塞；Core 1 负责异步停止 DMA 和卸载 I2S，网络 worker 在已有
+I/O 返回或超时后自行清理，不强行删除任务或从其他线程关闭网络句柄。
+
+取消标志保持到对应 worker 清理结束，因此即使用户立即唤醒并重新开放音频，
+旧 ASR/Agent/TTS 响应也不能触发新播放或发布新的结果。音频入口在同一把
+准入锁内复查取消条件；暂停会使旧 PCM 预填充和未提交的零拷贝预留失效，
+防止检查取消后、真正启动前的竞争，以及唤醒后提交旧缓冲。
+
+休眠时只有整点报时可以暂时解除音频暂停，前提是 voice/chime/radio 均不 busy
+且底层 phase 为 IDLE；报时完成后恢复暂停，显示保持关闭。息屏不暂停音频。
+唤醒只解除暂停，不清除尚在退出的旧 worker 的取消标志。
+
 ## 已确认的关键不变量
 
 1. 只有一个音频业务可以进入活动状态。
@@ -125,8 +144,8 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
 
 | 文件 | 重点 |
 |---|---|
-| `main/app_main.c` | `audio_activity_busy()`、按钮状态、`pump_voice()`、调度互斥 |
-| `main/voice_chat.c` | Voice 状态机、主循环到 worker 的所有权交接 |
+| `main/app_main.c` | `audio_activity_busy()`、按钮状态、休眠与整点调度互斥 |
+| `main/voice_chat.c` | Voice 状态机、worker 独占 ASR 和协作式取消 |
 | `main/chime_player.c` | Chime worker 状态机 |
 | `main/doubao_tts_player.c` | speaker ring 预填充、PLAY 启停和错误清理 |
 | `main/audio_io.c` | Core 1 phase、启动确认、取消、ring role 和 I2S 生命周期 |

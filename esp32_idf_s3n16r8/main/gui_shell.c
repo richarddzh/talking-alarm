@@ -258,3 +258,24 @@ bool gui_shell_current_app_is(const char *id) {
     return !s_launcher && id && s_app_count > 0 &&
            strcmp(s_apps[s_current_app]->id, id) == 0;
 }
+
+void gui_shell_invalidate(void) {
+    ui_invalidate();
+    s_launcher_icons_drawn = false;
+}
+
+void gui_shell_exit_game(void) {
+    if (s_launcher || s_app_count == 0) return;
+    const gui_app_t *app = s_apps[s_current_app];
+    if (app->icon != GUI_ICON_TETRIS && app->icon != GUI_ICON_SNAKE) return;
+    gui_shell_show_launcher();
+}
+
+void gui_shell_show_launcher(void) {
+    if (!s_launcher && s_app_count > 0 && s_apps[s_current_app]->exit) {
+        s_apps[s_current_app]->exit();
+    }
+    s_launcher = true;
+    s_focus = (int)s_current_app;
+    gui_shell_invalidate();
+}

@@ -20,6 +20,8 @@ static wifi_creds_t  s_creds;
 static bool          s_inited;
 static bool          s_started;
 static bool          s_connected;
+static volatile bool s_connecting;
+static TickType_t    s_connect_started;
 static uint8_t       s_last_disconnect_reason;
 static EventGroupHandle_t s_evt;
 #define EVT_GOT_IP   BIT0
@@ -40,6 +42,7 @@ static void event_handler(void *arg, esp_event_base_t base,
         xEventGroupSetBits(s_evt, EVT_FAIL);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_connected = true;
+        s_connecting = false;
         xEventGroupSetBits(s_evt, EVT_GOT_IP);
     }
 }
@@ -101,9 +104,22 @@ const char *wifi_time_last_disconnect_reason_text(void) {
     }
 }
 
-esp_err_t wifi_time_connect(void) {
+esp_err_t wifi_time_connect_async(void) {
     if (!wifi_time_has_credentials()) return ESP_ERR_INVALID_STATE;
     if (s_connected) return ESP_OK;
+    if (s_connecting) {
+        EventBits_t bits = xEventGroupGetBits(s_evt);
+        if (!(bits & EVT_FAIL) &&
+            xTaskGetTickCount() - s_connect_started <
+                pdMS_TO_TICKS(APP_WIFI_CONNECT_TIMEOUT_MS)) {
+            return ESP_ERR_NOT_FINISHED;
+        }
+        s_connecting = false;
+        ESP_LOGW(TAG, "STA connect failed, reason=%u (%s)",
+                 s_last_disconnect_reason,
+                 wifi_time_last_disconnect_reason_text());
+        return ESP_FAIL;
+    }
 
     xEventGroupClearBits(s_evt, EVT_GOT_IP | EVT_FAIL);
     s_last_disconnect_reason = 0;
@@ -113,26 +129,36 @@ esp_err_t wifi_time_connect(void) {
     strncpy((char *)wc.sta.password, s_creds.password,
             sizeof(wc.sta.password) - 1);
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (err != ESP_OK) return err;
+    s_connect_started = xTaskGetTickCount();
+    s_connecting = true;
 
     if (!s_started) {
-        ESP_ERROR_CHECK(esp_wifi_start());
-        s_started = true;
+        err = esp_wifi_start();
+        if (err == ESP_OK) s_started = true;
     } else {
-        esp_wifi_connect();
+        err = esp_wifi_connect();
     }
+    if (err != ESP_OK) {
+        s_connecting = false;
+        ESP_LOGE(TAG, "STA connect start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    return ESP_ERR_NOT_FINISHED;
+}
 
-    EventBits_t bits = xEventGroupWaitBits(
+esp_err_t wifi_time_connect(void) {
+    esp_err_t err = wifi_time_connect_async();
+    if (err != ESP_ERR_NOT_FINISHED) return err;
+    xEventGroupWaitBits(
         s_evt, EVT_GOT_IP | EVT_FAIL, pdFALSE, pdFALSE,
         pdMS_TO_TICKS(APP_WIFI_CONNECT_TIMEOUT_MS));
-    if (bits & EVT_GOT_IP) return ESP_OK;
-    ESP_LOGW(TAG, "STA connect failed, reason=%u (%s)",
-             s_last_disconnect_reason,
-             wifi_time_last_disconnect_reason_text());
-    return ESP_FAIL;
+    return wifi_time_connect_async();
 }
 
 esp_err_t wifi_time_disconnect(void) {
+    s_connecting = false;
     if (!s_started) return ESP_OK;
     esp_wifi_disconnect();
     esp_wifi_stop();

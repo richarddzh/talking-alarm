@@ -45,6 +45,17 @@ static esp_err_t set_window(int x, int y, int width, int height) {
 }
 
 esp_err_t st7789_init(void) {
+#if APP_TFT_BACKLIGHT_PIN >= 0
+    gpio_config_t backlight_config = {
+        .pin_bit_mask = 1ULL << APP_TFT_BACKLIGHT_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    esp_err_t backlight_err = gpio_config(&backlight_config);
+    if (backlight_err != ESP_OK) return backlight_err;
+    backlight_err = gpio_set_level(APP_TFT_BACKLIGHT_PIN,
+                                   !APP_TFT_BACKLIGHT_ON);
+    if (backlight_err != ESP_OK) return backlight_err;
+#endif
     gpio_config_t dc_config = {
         .pin_bit_mask = 1ULL << APP_TFT_DC_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -98,10 +109,40 @@ esp_err_t st7789_init(void) {
     if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(20));
 
+#if APP_TFT_BACKLIGHT_PIN >= 0
+    err = gpio_set_level(APP_TFT_BACKLIGHT_PIN, APP_TFT_BACKLIGHT_ON);
+    if (err != ESP_OK) return err;
+#endif
     ESP_LOGI(TAG, "ready %dx%d SCLK=%d MOSI=%d DC=%d CS=%d",
              APP_TFT_W, APP_TFT_H, APP_TFT_SCLK_PIN, APP_TFT_MOSI_PIN,
              APP_TFT_DC_PIN, APP_TFT_CS_PIN);
     return ESP_OK;
+}
+
+esp_err_t st7789_set_sleep(bool asleep) {
+    if (asleep) {
+#if APP_TFT_BACKLIGHT_PIN >= 0
+        esp_err_t err = gpio_set_level(APP_TFT_BACKLIGHT_PIN,
+                                       !APP_TFT_BACKLIGHT_ON);
+        if (err != ESP_OK) return err;
+#endif
+        esp_err_t result = command(0x28); // DISPOFF
+        if (result != ESP_OK) return result;
+        result = command(0x10); // SLPIN
+        if (result != ESP_OK) return result;
+        vTaskDelay(pdMS_TO_TICKS(120));
+        return ESP_OK;
+    }
+    esp_err_t err = command(0x11); // SLPOUT
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(120));
+    err = command(0x29); // DISPON
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(20));
+#if APP_TFT_BACKLIGHT_PIN >= 0
+    err = gpio_set_level(APP_TFT_BACKLIGHT_PIN, APP_TFT_BACKLIGHT_ON);
+#endif
+    return err;
 }
 
 esp_err_t st7789_show_indexed4(const uint8_t *framebuffer,

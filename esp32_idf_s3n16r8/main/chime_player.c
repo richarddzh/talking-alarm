@@ -15,6 +15,9 @@ static const char *TAG = "chime";
 #define CHIME_TASK_PRIO 4
 
 static TaskHandle_t s_worker_task;
+static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_busy;
+static bool s_cancelled;
 static volatile chime_status_t s_status = CHIME_IDLE;
 static char s_msg[48] = "chime idle";
 static char s_time_arg[16];
@@ -24,6 +27,37 @@ static chime_player_status_cb_t s_status_cb;
 static void *s_status_ctx;
 static chime_player_text_cb_t s_text_cb;
 static void *s_text_ctx;
+
+static bool cancelled(void *ctx) {
+    (void)ctx;
+    if (audio_io_is_suspended()) {
+        __atomic_store_n(&s_cancelled, true, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&s_cancelled, __ATOMIC_ACQUIRE);
+}
+
+void chime_player_cancel(void) {
+    taskENTER_CRITICAL(&s_lock);
+    bool busy = __atomic_load_n(&s_busy, __ATOMIC_RELAXED);
+    if (busy) {
+        __atomic_store_n(&s_cancelled, true, __ATOMIC_RELEASE);
+        audio_io_request_abort();
+    }
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static bool begin_job(void) {
+    taskENTER_CRITICAL(&s_lock);
+    bool allowed = !__atomic_load_n(&s_busy, __ATOMIC_RELAXED) &&
+                   !audio_io_is_suspended() &&
+                   audio_io_phase() == AUDIO_PHASE_IDLE;
+    if (allowed) {
+        __atomic_store_n(&s_cancelled, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_busy, true, __ATOMIC_RELEASE);
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    return allowed;
+}
 
 static void set_status(chime_status_t st, const char *msg) {
     s_status = st;
@@ -36,7 +70,7 @@ static void set_status(chime_status_t st, const char *msg) {
 
 static void chime_tts_status(void *ctx, const char *msg) {
     (void)ctx;
-    if (!msg) return;
+    if (!msg || cancelled(NULL)) return;
     if (strstr(msg, "playing")) {
         set_status(CHIME_PLAYING, "playing chime");
     } else if (strstr(msg, "drain")) {
@@ -50,44 +84,39 @@ static void chime_worker(void *arg) {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (s_status != CHIME_CONNECTING) continue;
-
-        if (s_text_only) {
-            set_status(CHIME_WAITING_REPLY, "tts speak");
-            esp_err_t err = doubao_tts_play_text(s_fixed_text,
-                                                 chime_tts_status, NULL);
-            s_text_only = false;
-            s_fixed_text[0] = 0;
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "tts speak err=%s", esp_err_to_name(err));
-                set_status(CHIME_ERROR, "tts fail");
-                continue;
-            }
-            set_status(CHIME_DONE, "tts done");
-            continue;
-        }
-
-        set_status(CHIME_WAITING_REPLY, "agent chime");
+        if (!chime_player_busy()) continue;
         char *text = NULL;
-        esp_err_t err = doubao_agent_chime(s_time_arg, &text);
-        if (err != ESP_OK || !text || !text[0]) {
-            ESP_LOGE(TAG, "agent chime err=%s", esp_err_to_name(err));
-            free(text);
-            set_status(CHIME_ERROR, "chime fail");
-            continue;
-        }
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        if (cancelled(NULL)) goto done;
 
-        ESP_LOGI(TAG, "chime text %u bytes: %s", (unsigned)strlen(text), text);
-        if (s_text_cb) s_text_cb(text, s_text_ctx);
-        set_status(CHIME_WAITING_REPLY, "tts chime");
-        err = doubao_tts_play_text(text, chime_tts_status, NULL);
-        free(text);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "tts err=%s", esp_err_to_name(err));
-            set_status(CHIME_ERROR, "chime tts fail");
-            continue;
+        if (!s_text_only) {
+            set_status(CHIME_WAITING_REPLY, "agent chime");
+            err = doubao_agent_chime(s_time_arg, &text);
+            if (cancelled(NULL) || err != ESP_OK || !text || !text[0]) {
+                if (err == ESP_OK) err = ESP_FAIL;
+                goto done;
+            }
+            if (s_text_cb && !cancelled(NULL)) s_text_cb(text, s_text_ctx);
         }
-        set_status(CHIME_DONE, "chime done");
+        if (cancelled(NULL)) goto done;
+        set_status(CHIME_WAITING_REPLY, "tts chime");
+        err = doubao_tts_play_text_cancellable(s_text_only ? s_fixed_text : text,
+                                              chime_tts_status, NULL,
+                                              cancelled, NULL);
+done:
+        free(text);
+        s_text_only = false;
+        s_fixed_text[0] = 0;
+        if (cancelled(NULL)) {
+            audio_io_abort(2000);
+            set_status(CHIME_IDLE, "chime cancelled");
+        } else if (err != ESP_OK) {
+            ESP_LOGE(TAG, "chime err=%s", esp_err_to_name(err));
+            set_status(CHIME_ERROR, "chime fail");
+        } else {
+            set_status(CHIME_DONE, "chime done");
+        }
+        __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
     }
 }
 
@@ -102,15 +131,7 @@ esp_err_t chime_player_init(void) {
 }
 
 bool chime_player_busy(void) {
-    switch (s_status) {
-    case CHIME_CONNECTING:
-    case CHIME_WAITING_REPLY:
-    case CHIME_PLAYING:
-    case CHIME_DRAINING:
-        return true;
-    default:
-        return false;
-    }
+    return __atomic_load_n(&s_busy, __ATOMIC_ACQUIRE);
 }
 
 chime_status_t chime_player_status(void) { return s_status; }
@@ -118,8 +139,7 @@ const char *chime_player_message(void) { return s_msg; }
 
 esp_err_t chime_player_start(const char *time_arg) {
     if (!s_worker_task) return ESP_ERR_INVALID_STATE;
-    if (chime_player_busy()) return ESP_ERR_INVALID_STATE;
-    if (audio_io_phase() != AUDIO_PHASE_IDLE) return ESP_ERR_INVALID_STATE;
+    if (!begin_job()) return ESP_ERR_INVALID_STATE;
     if (time_arg) {
         strncpy(s_time_arg, time_arg, sizeof(s_time_arg) - 1);
         s_time_arg[sizeof(s_time_arg) - 1] = 0;
@@ -135,9 +155,8 @@ esp_err_t chime_player_start(const char *time_arg) {
 
 esp_err_t chime_player_start_text(const char *text) {
     if (!s_worker_task) return ESP_ERR_INVALID_STATE;
-    if (chime_player_busy()) return ESP_ERR_INVALID_STATE;
-    if (audio_io_phase() != AUDIO_PHASE_IDLE) return ESP_ERR_INVALID_STATE;
     if (!text || !text[0]) return ESP_ERR_INVALID_ARG;
+    if (!begin_job()) return ESP_ERR_INVALID_STATE;
     strncpy(s_fixed_text, text, sizeof(s_fixed_text) - 1);
     s_fixed_text[sizeof(s_fixed_text) - 1] = 0;
     s_text_only = true;

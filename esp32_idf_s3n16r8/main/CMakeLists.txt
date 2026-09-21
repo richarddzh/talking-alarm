@@ -21,6 +21,8 @@ idf_component_register(
         "gui_shell.c"
         "app_chat_alarm.c"
         "app_settings.c"
+        "power_settings.c"
+        "idle_power.c"
         "app_radio.c"
         "app_tetris.c"
         "app_snake.c"

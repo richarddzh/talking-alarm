@@ -12,3 +12,6 @@ gui_action_t gui_shell_tick(int64_t now_ms);
 void gui_shell_render(const gui_model_t *model);
 bool gui_shell_is_launcher(void);
 bool gui_shell_current_app_is(const char *id);
+void gui_shell_exit_game(void);
+void gui_shell_show_launcher(void);
+void gui_shell_invalidate(void);

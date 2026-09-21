@@ -17,18 +17,21 @@ typedef enum {
 esp_err_t voice_chat_init(void);
 
 bool voice_chat_busy(void);
+// Nonblocking, sticky for the accepted turn. Worker alone closes ASR/HTTP.
+// Busy remains true until cleanup; cancelled turns publish no late results.
+void voice_chat_cancel(void);
 voice_chat_status_t voice_chat_status(void);
 const char *voice_chat_message(void);
 
-// Open a Doubao ASR session, then ask audio_io to start recording.
+// Nonblocking: accept a turn; worker connects ASR then starts recording.
+// ESP_OK means accepted, not connected. Observe status for asynchronous errors.
 esp_err_t voice_chat_start(void);
 
-// Loop pump while recording: drains mic ring into ASR WebSocket frames.
-// Returns ESP_OK if still healthy (status may have changed).
+// Compatibility health poll; the worker now drains/uploads the mic ring.
 esp_err_t voice_chat_pump(void);
 
 // Request stop, then finish ASR, call the Agent and run TTS playback in
-// the background worker task.
+// the background worker task. Also accepts a stop while still connecting.
 esp_err_t voice_chat_stop_and_process(void);
 
 // Optional callback fires on every status change (any context).

@@ -19,4 +19,6 @@ void buttons_init(void);
 bool buttons_poll(app_input_event_t *event);
 
 bool buttons_pressed(void);
+// Includes held buttons and deflected axes, even between repeat events.
+bool buttons_active(void);
 const char *buttons_event_name(app_input_event_t event);

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <esp_err.h>
 
 esp_err_t st7789_init(void);
+esp_err_t st7789_set_sleep(bool asleep);
 
 // Displays a packed 4-bit indexed-color framebuffer. The high nibble is
 // the left/even pixel and the low nibble is the right/odd pixel.

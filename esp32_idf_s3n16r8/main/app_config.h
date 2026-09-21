@@ -23,6 +23,9 @@
 #define APP_TFT_SPI_FREQ_HZ    40000000
 #define APP_TFT_X_OFFSET       0
 #define APP_TFT_Y_OFFSET       0
+// Set to a wired backlight control GPIO; -1 means externally powered.
+#define APP_TFT_BACKLIGHT_PIN  (-1)
+#define APP_TFT_BACKLIGHT_ON   1
 
 // ---- Buttons (active-low, internal pull-up) ----------------------------
 #define APP_BUTTON_PIN             4
@@ -91,7 +94,9 @@
 #define APP_DOUBAO_TTS_SAMPLE_RATE   APP_VOICE_SAMPLE_RATE
 
 // ---- Storage -----------------------------------------------------------
+#ifndef APP_SPIFFS_BASE_PATH
 #define APP_SPIFFS_BASE_PATH         "/spiffs"
+#endif
 #define APP_WIFI_CONFIG_PATH         "/spiffs/wifi_config.txt"
 #define APP_WIFI_PROFILES_PATH       "/spiffs/wifi_profiles.bin"
 #define APP_SECRETS_CONFIG_PATH      "/spiffs/app_secrets.txt"

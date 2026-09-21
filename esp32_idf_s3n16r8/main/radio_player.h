@@ -33,6 +33,9 @@ typedef struct {
 esp_err_t radio_player_init(void);
 esp_err_t radio_player_start(size_t station_index);
 esp_err_t radio_player_stop(uint32_t timeout_ms);
+// Nonblocking stop/abort request. Busy remains true until the worker closes
+// its own HTTP/decoder; a new start cannot clear an outstanding cancellation.
+void radio_player_request_stop(void);
 bool radio_player_busy(void);
 void radio_player_get_snapshot(radio_player_snapshot_t *snapshot);
 void radio_player_set_volume(uint8_t level);

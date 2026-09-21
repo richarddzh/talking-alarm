@@ -205,11 +205,10 @@ static bool poll_joystick_button(bool axes_neutral,
 
 bool buttons_poll(app_input_event_t *event) {
     if (!event) return false;
-    if (poll_digital(&s_main, APP_INPUT_MAIN_PRESSED,
-                     APP_INPUT_MAIN_RELEASED,
-                     APP_BUTTON_DEBOUNCE_MS, event)) {
-        return true;
-    }
+    app_input_event_t main_event = APP_INPUT_MAIN_PRESSED;
+    bool main_ready = poll_digital(&s_main, APP_INPUT_MAIN_PRESSED,
+                                   APP_INPUT_MAIN_RELEASED,
+                                   APP_BUTTON_DEBOUNCE_MS, &main_event);
 
     app_input_event_t x_event = APP_INPUT_LEFT;
     app_input_event_t y_event = APP_INPUT_UP;
@@ -230,6 +229,10 @@ bool buttons_poll(app_input_event_t *event) {
     app_input_event_t button_event = APP_INPUT_JOYSTICK_PRESSED;
     bool button_ready = poll_joystick_button(axes_neutral, &button_event);
 
+    if (main_ready) {
+        *event = main_event;
+        return true;
+    }
     if (x_ready) {
         *event = x_event;
         return true;
@@ -247,6 +250,11 @@ bool buttons_poll(app_input_event_t *event) {
 
 bool buttons_pressed(void) {
     return s_main.stable_pressed;
+}
+
+bool buttons_active(void) {
+    return s_main.stable_pressed || s_joystick_button.stable_pressed ||
+           s_axis_x.active_direction != 0 || s_axis_y.active_direction != 0;
 }
 
 const char *buttons_event_name(app_input_event_t event) {

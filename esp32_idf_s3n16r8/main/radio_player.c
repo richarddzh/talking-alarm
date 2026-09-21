@@ -31,7 +31,8 @@
 static const char *TAG = "radio_player";
 
 static TaskHandle_t s_task;
-static volatile bool s_stop_requested;
+static bool s_stop_requested;
+static bool s_busy;
 static radio_player_snapshot_t s_snapshot = {
     .state = RADIO_PLAYER_IDLE,
     .station_index = 0,
@@ -46,8 +47,24 @@ static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
 }
 
+static bool stop_requested(void) {
+    if (audio_io_is_suspended()) {
+        __atomic_store_n(&s_stop_requested, true, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE);
+}
+
+static bool playback_cancelled(void *ctx) {
+    (void)ctx;
+    return stop_requested();
+}
+
 static void set_state(radio_player_state_t state, const char *message) {
     taskENTER_CRITICAL(&s_lock);
+    if (stop_requested() && state != RADIO_PLAYER_IDLE) {
+        taskEXIT_CRITICAL(&s_lock);
+        return;
+    }
     s_snapshot.state = state;
     snprintf(s_snapshot.message, sizeof(s_snapshot.message), "%s",
              message ? message : "");
@@ -68,6 +85,7 @@ static void finish_task(void) {
     taskENTER_CRITICAL(&s_lock);
     s_task = NULL;
     ++s_snapshot.generation;
+    __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
     taskEXIT_CRITICAL(&s_lock);
     vTaskDelete(NULL);
 }
@@ -144,22 +162,23 @@ static esp_err_t push_pcm(uint8_t *data, size_t size, uint8_t channels,
                           bool *playback_started, size_t *prefill_bytes) {
     process_pcm((int16_t *)data, size, channels);
     size_t offset = 0;
-    while (offset < size && !s_stop_requested) {
+    while (offset < size && !stop_requested()) {
         size_t written = audio_io_write_speaker(
             data + offset, size - offset, RADIO_WRITE_TIMEOUT_MS);
         if (written == 0) return ESP_ERR_TIMEOUT;
+        if (stop_requested()) return ESP_ERR_INVALID_STATE;
         offset += written;
         if (!*playback_started) {
             *prefill_bytes += written;
             if (*prefill_bytes >= RADIO_PREFILL_BYTES) {
-                esp_err_t err = audio_io_start_playback(2000);
+                esp_err_t err = audio_io_start_playback_cancellable(2000, playback_cancelled, NULL);
                 if (err != ESP_OK) return err;
                 *playback_started = true;
                 set_state(RADIO_PLAYER_PLAYING, "正在播放");
             }
         }
     }
-    return s_stop_requested ? ESP_ERR_INVALID_STATE : ESP_OK;
+    return stop_requested() ? ESP_ERR_INVALID_STATE : ESP_OK;
 }
 
 static esp_err_t decode_stream(esp_http_client_handle_t client) {
@@ -193,7 +212,7 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
     esp_err_t result = ESP_OK;
     set_state(RADIO_PLAYER_BUFFERING, "正在缓冲");
 
-    while (!s_stop_requested) {
+    while (!stop_requested()) {
         int read = esp_http_client_read(client, (char *)input,
                                         RADIO_INPUT_BYTES);
         if (read == -ESP_ERR_HTTP_EAGAIN) continue;
@@ -211,7 +230,7 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
             .len = (uint32_t)read,
             .eos = false,
         };
-        while (raw.len > 0 && !s_stop_requested) {
+        while (raw.len > 0 && !stop_requested()) {
             esp_audio_simple_dec_out_t frame = {
                 .buffer = output,
                 .len = RADIO_OUTPUT_BYTES,
@@ -240,8 +259,8 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
                         result = ESP_ERR_NOT_SUPPORTED;
                         break;
                     }
-                    result = audio_io_prepare_speaker(info.sample_rate,
-                                                      info.channel);
+                    result = audio_io_prepare_speaker_cancellable(info.sample_rate,
+                                                      info.channel, playback_cancelled, NULL);
                     if (result != ESP_OK) break;
                     set_format(&info);
                     format_ready = true;
@@ -263,12 +282,12 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
         if (result != ESP_OK) break;
     }
 
-    if (!playback_started && prefill_bytes > 0 && result == ESP_OK) {
-        result = audio_io_start_playback(2000);
+    if (!stop_requested() && !playback_started && prefill_bytes > 0 && result == ESP_OK) {
+        result = audio_io_start_playback_cancellable(2000, playback_cancelled, NULL);
         playback_started = result == ESP_OK;
     }
     if (playback_started) {
-        if (s_stop_requested) {
+        if (stop_requested()) {
             audio_io_abort(2000);
         } else {
             audio_io_stop_playback(3000);
@@ -284,6 +303,11 @@ static void radio_task(void *arg) {
     size_t station_index = (size_t)(uintptr_t)arg;
     const radio_station_t *station = radio_station_get(station_index);
     esp_err_t result = ESP_FAIL;
+    if (stop_requested()) {
+        set_state(RADIO_PLAYER_IDLE, "已停止");
+        finish_task();
+        return;
+    }
 
     esp_http_client_config_t config = {
         .url = station->url,
@@ -298,7 +322,8 @@ static void radio_task(void *arg) {
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
-        set_state(RADIO_PLAYER_ERROR, "HTTP 初始化失败");
+        if (stop_requested()) set_state(RADIO_PLAYER_IDLE, "已停止");
+        else set_state(RADIO_PLAYER_ERROR, "HTTP 初始化失败");
         finish_task();
         return;
     }
@@ -309,13 +334,13 @@ static void radio_task(void *arg) {
     esp_http_client_set_header(client, "User-Agent", "TalkingAlarm/1.0");
 
     set_state(RADIO_PLAYER_CONNECTING, "正在连接");
-    result = esp_http_client_open(client, 0);
-    if (result == ESP_OK) {
+    result = stop_requested() ? ESP_ERR_INVALID_STATE : esp_http_client_open(client, 0);
+    if (!stop_requested() && result == ESP_OK) {
         int64_t content_length = esp_http_client_fetch_headers(client);
         int status = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "%s HTTP %d length=%lld", station->name, status,
                  (long long)content_length);
-        if (status == 200 || status == 206) {
+        if (!stop_requested() && (status == 200 || status == 206)) {
             result = decode_stream(client);
         } else {
             result = ESP_ERR_INVALID_RESPONSE;
@@ -324,7 +349,7 @@ static void radio_task(void *arg) {
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (s_stop_requested) {
+    if (stop_requested()) {
         set_state(RADIO_PLAYER_IDLE, "已停止");
     } else if (result == ESP_OK) {
         set_state(RADIO_PLAYER_IDLE, "播放结束");
@@ -344,11 +369,14 @@ esp_err_t radio_player_init(void) {
 
 esp_err_t radio_player_start(size_t station_index) {
     if (!radio_station_get(station_index)) return ESP_ERR_INVALID_ARG;
-    if (radio_player_busy()) return ESP_ERR_INVALID_STATE;
-    if (audio_io_phase() != AUDIO_PHASE_IDLE) return ESP_ERR_INVALID_STATE;
-
     taskENTER_CRITICAL(&s_lock);
-    s_stop_requested = false;
+    if (radio_player_busy() || audio_io_is_suspended() ||
+        audio_io_phase() != AUDIO_PHASE_IDLE) {
+        taskEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    __atomic_store_n(&s_stop_requested, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_busy, true, __ATOMIC_RELEASE);
     s_snapshot.station_index = station_index;
     s_snapshot.sample_rate = 0;
     s_snapshot.channels = 0;
@@ -366,7 +394,9 @@ esp_err_t radio_player_start(size_t station_index) {
         (void *)(uintptr_t)station_index, RADIO_TASK_PRIORITY, &s_task,
         RADIO_TASK_CORE);
     if (created != pdPASS) {
-        set_state(RADIO_PLAYER_ERROR, "播放器任务创建失败");
+        if (stop_requested()) set_state(RADIO_PLAYER_IDLE, "已停止");
+        else set_state(RADIO_PLAYER_ERROR, "播放器任务创建失败");
+        __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -379,10 +409,9 @@ esp_err_t radio_player_stop(uint32_t timeout_ms) {
         }
         return ESP_OK;
     }
-    s_stop_requested = true;
-    set_state(RADIO_PLAYER_STOPPING, "正在停止");
+    radio_player_request_stop();
     int64_t start = now_ms();
-    while (s_task) {
+    while (radio_player_busy()) {
         if ((uint32_t)(now_ms() - start) >= timeout_ms) {
             return ESP_ERR_TIMEOUT;
         }
@@ -392,7 +421,19 @@ esp_err_t radio_player_stop(uint32_t timeout_ms) {
 }
 
 bool radio_player_busy(void) {
-    return s_task != NULL;
+    return __atomic_load_n(&s_busy, __ATOMIC_ACQUIRE);
+}
+
+void radio_player_request_stop(void) {
+    taskENTER_CRITICAL(&s_lock);
+    if (radio_player_busy()) {
+        __atomic_store_n(&s_stop_requested, true, __ATOMIC_RELEASE);
+        s_snapshot.state = RADIO_PLAYER_STOPPING;
+        snprintf(s_snapshot.message, sizeof(s_snapshot.message), "正在停止");
+        ++s_snapshot.generation;
+        audio_io_request_abort();
+    }
+    taskEXIT_CRITICAL(&s_lock);
 }
 
 void radio_player_get_snapshot(radio_player_snapshot_t *snapshot) {

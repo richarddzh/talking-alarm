@@ -34,6 +34,8 @@ const char *wifi_time_last_disconnect_reason_text(void);
 
 // Connect (if not yet connected) using the active credentials. Blocks.
 esp_err_t wifi_time_connect(void);
+// Start/poll a connection without blocking input; ESP_ERR_NOT_FINISHED while pending.
+esp_err_t wifi_time_connect_async(void);
 // Disconnect station and stop, freeing buffers before setup AP starts.
 esp_err_t wifi_time_disconnect(void);
 esp_err_t wifi_time_scan(wifi_scan_ap_t *results, size_t capacity,

@@ -15,6 +15,9 @@ typedef enum {
 
 esp_err_t chime_player_init(void);
 bool      chime_player_busy(void);
+// Nonblocking, sticky for the accepted job. Busy stays true through network
+// cleanup; no late text/TTS is published. New starts are rejected while busy.
+void      chime_player_cancel(void);
 chime_status_t chime_player_status(void);
 const char *chime_player_message(void);
 esp_err_t  chime_player_start(const char *time_arg);

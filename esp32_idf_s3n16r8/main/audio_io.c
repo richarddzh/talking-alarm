@@ -50,6 +50,28 @@ static volatile uint32_t s_mic_overflow_chunks = 0;
 static volatile uint32_t s_spk_underrun = 0;
 static volatile uint32_t s_spk_sample_rate = APP_VOICE_SAMPLE_RATE;
 static volatile uint8_t  s_spk_channels = 1;
+static portMUX_TYPE s_control_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_suspended;
+static uint32_t s_epoch;
+static uint32_t s_ring_epoch;
+
+bool audio_io_is_suspended(void) {
+    return __atomic_load_n(&s_suspended, __ATOMIC_ACQUIRE);
+}
+
+static bool ring_cancelled(void) {
+    return audio_io_is_suspended() ||
+           __atomic_load_n(&s_ring_epoch, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&s_epoch, __ATOMIC_ACQUIRE);
+}
+
+static void finish_phase(void) {
+    taskENTER_CRITICAL(&s_control_lock);
+    s_req_stop = 0;
+    s_req_abort = 0;
+    s_phase = AUDIO_PHASE_IDLE;
+    taskEXIT_CRITICAL(&s_control_lock);
+}
 
 // --- Reusable scratch buffers (kept off the task stack) -----------------
 // 与下面 install_mic / install_speaker 的 dma_frame_num 对齐：每次
@@ -166,7 +188,7 @@ static esp_err_t install_speaker(void) {
     size_t silence_written = 0;
     err = i2s_channel_write(s_spk_chan, s_i2s_write_buf,
                             sizeof(s_i2s_write_buf), &silence_written,
-                            portMAX_DELAY);
+                            20);
     if (err != ESP_OK || silence_written != sizeof(s_i2s_write_buf)) {
         i2s_channel_disable(s_spk_chan);
         i2s_del_channel(s_spk_chan);
@@ -188,13 +210,22 @@ static void uninstall_speaker(void) {
     audio_io_quiet_speaker_pins();
 }
 
+static size_t write_speaker(const uint8_t *data, size_t len) {
+    size_t total = 0;
+    while (total < len && !s_req_abort && !audio_io_is_suspended()) {
+        size_t written = 0;
+        esp_err_t err = i2s_channel_write(s_spk_chan, data + total, len - total,
+                                          &written, 20);
+        total += written;
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) break;
+    }
+    return total;
+}
+
 // --- Recording phase: reuse arena as mic ring; producer = audio task ----
 static void do_recording(void) {
     if (install_mic() != ESP_OK) {
-        s_req_stop = 0;
-        s_req_abort = 0;
-        __sync_synchronize();
-        s_phase = AUDIO_PHASE_IDLE;
+        finish_phase();
         return;
     }
     ring_reset(&s_ring);
@@ -204,11 +235,11 @@ static void do_recording(void) {
     s_phase = AUDIO_PHASE_REC;
     ESP_LOGI(TAG, "REC start");
 
-    while (!s_req_stop && !s_req_abort) {
+    while (!s_req_stop && !s_req_abort && !audio_io_is_suspended()) {
         size_t bytes_read = 0;
         esp_err_t e = i2s_channel_read(s_mic_chan, s_i2s_read_buf,
                                        sizeof(s_i2s_read_buf),
-                                       &bytes_read, pdMS_TO_TICKS(20));
+                                       &bytes_read, 20);
         if (e != ESP_OK || bytes_read == 0) continue;
 
         size_t in_samples  = bytes_read / sizeof(int32_t);
@@ -235,10 +266,7 @@ static void do_recording(void) {
     }
 
     uninstall_mic();
-    s_req_stop = 0;
-    s_req_abort = 0;
-    __sync_synchronize();
-    s_phase = AUDIO_PHASE_IDLE;
+    finish_phase();
     ESP_LOGI(TAG, "REC stop overflow_chunks=%u", (unsigned)s_mic_overflow_chunks);
     mem_log("REC stop");
 }
@@ -246,10 +274,7 @@ static void do_recording(void) {
 // --- Playback phase: reuse arena as speaker ring; consumer = audio task -
 static void do_playback(void) {
     if (install_speaker() != ESP_OK) {
-        s_req_stop = 0;
-        s_req_abort = 0;
-        __sync_synchronize();
-        s_phase = AUDIO_PHASE_IDLE;
+        finish_phase();
         return;
     }
     s_spk_underrun = 0;
@@ -261,12 +286,10 @@ static void do_playback(void) {
     int64_t last_data_ms = now_ms();
     size_t  total_bytes = 0;
 
-    while (!s_req_abort) {
+    while (!s_req_abort && !audio_io_is_suspended()) {
         size_t got = ring_read(&s_ring, s_i2s_write_buf, sizeof(s_i2s_write_buf));
         if (got > 0) {
-            size_t wrote = 0;
-            i2s_channel_write(s_spk_chan, s_i2s_write_buf, got, &wrote,
-                              portMAX_DELAY);
+            size_t wrote = write_speaker(s_i2s_write_buf, got);
             total_bytes += wrote;
             last_data_ms = now_ms();
             continue;
@@ -275,9 +298,7 @@ static void do_playback(void) {
             // Drain any leftover that arrived between read and stop check.
             got = ring_read(&s_ring, s_i2s_write_buf, sizeof(s_i2s_write_buf));
             if (got > 0) {
-                size_t wrote = 0;
-                i2s_channel_write(s_spk_chan, s_i2s_write_buf, got, &wrote,
-                                  portMAX_DELAY);
+                size_t wrote = write_speaker(s_i2s_write_buf, got);
                 total_bytes += wrote;
                 continue;
             }
@@ -290,19 +311,17 @@ static void do_playback(void) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 
-    // End with digital silence before releasing the I2S pins.
-    memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
-    size_t silence_written = 0;
-    i2s_channel_write(s_spk_chan, s_i2s_write_buf,
-                      sizeof(s_i2s_write_buf), &silence_written,
-                      portMAX_DELAY);
-    // i2s_channel_write returns once data is queued; wait for DMA drain.
-    vTaskDelay(pdMS_TO_TICKS(350));
+    if (!s_req_abort && !audio_io_is_suspended()) {
+        memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
+        write_speaker(s_i2s_write_buf, sizeof(s_i2s_write_buf));
+        // Normal completion drains DMA; cancellation must not wait for it.
+        int64_t until = now_ms() + 350;
+        while (!s_req_abort && !audio_io_is_suspended() && now_ms() < until) {
+            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        }
+    }
     uninstall_speaker();
-    s_req_stop = 0;
-    s_req_abort = 0;
-    __sync_synchronize();
-    s_phase = AUDIO_PHASE_IDLE;
+    finish_phase();
     ESP_LOGI(TAG, "PLAY stop bytes=%u underrun=%u",
              (unsigned)total_bytes, (unsigned)s_spk_underrun);
     mem_log("PLAY stop");
@@ -315,16 +334,15 @@ static void task_run(void *arg) {
         while (s_req_start == REQ_NONE) {
             vTaskDelay(pdMS_TO_TICKS(POLL_MS));
         }
+        taskENTER_CRITICAL(&s_control_lock);
         uint8_t r = s_req_start;
         s_req_start = REQ_NONE;
-        __sync_synchronize();
         // A timeout/abort can race with this task consuming the start
         // request. Never erase that cancellation after taking the request.
-        if (s_req_stop || s_req_abort) {
-            s_req_stop = 0;
-            s_req_abort = 0;
-            __sync_synchronize();
-            s_phase = AUDIO_PHASE_IDLE;
+        bool cancelled = s_req_stop || s_req_abort || audio_io_is_suspended();
+        taskEXIT_CRITICAL(&s_control_lock);
+        if (cancelled) {
+            finish_phase();
             continue;
         }
         if      (r == REQ_START_REC)  do_recording();
@@ -358,6 +376,9 @@ esp_err_t audio_io_init(void) {
 static esp_err_t wait_phase(audio_phase_t target, uint32_t timeout_ms) {
     int64_t t0 = now_ms();
     while (s_phase != target) {
+        if (target != AUDIO_PHASE_IDLE &&
+            (audio_io_is_suspended() || s_req_abort ||
+             s_phase == AUDIO_PHASE_IDLE)) return ESP_ERR_INVALID_STATE;
         if (now_ms() - t0 > timeout_ms) return ESP_ERR_TIMEOUT;
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
@@ -365,20 +386,31 @@ static esp_err_t wait_phase(audio_phase_t target, uint32_t timeout_ms) {
 }
 
 esp_err_t audio_io_start_recording(uint32_t ack_timeout_ms) {
+    return audio_io_start_recording_cancellable(ack_timeout_ms, NULL, NULL);
+}
+
+esp_err_t audio_io_start_recording_cancellable(uint32_t ack_timeout_ms,
+                                               audio_io_cancel_cb_t cancelled,
+                                               void *ctx) {
     if (!s_task) return ESP_ERR_INVALID_STATE;
-    if (s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
+    taskENTER_CRITICAL(&s_control_lock);
+    if ((cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
+        s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
+        taskEXIT_CRITICAL(&s_control_lock);
         return ESP_ERR_INVALID_STATE;
     }
     s_req_stop = 0;
     s_req_abort = 0;
-    __sync_synchronize();
+    __atomic_store_n(&s_ring_epoch, __atomic_load_n(&s_epoch, __ATOMIC_RELAXED),
+                     __ATOMIC_RELEASE);
+    s_phase = AUDIO_PHASE_STARTING;
     s_req_start = REQ_START_REC;
+    taskEXIT_CRITICAL(&s_control_lock);
     esp_err_t e = wait_phase(AUDIO_PHASE_REC, ack_timeout_ms);
     if (e != ESP_OK) {
         // Either the request was never picked up or it picked up but
         // failed during install. Either way, force back to IDLE so the
         // next attempt won't be rejected.
-        s_req_start = REQ_NONE;
         audio_io_abort(2000);
     }
     return e;
@@ -386,25 +418,34 @@ esp_err_t audio_io_start_recording(uint32_t ack_timeout_ms) {
 
 esp_err_t audio_io_stop_recording(uint32_t ack_timeout_ms) {
     if (s_phase == AUDIO_PHASE_IDLE) return ESP_OK;
-    if (s_phase != AUDIO_PHASE_REC) return ESP_ERR_INVALID_STATE;
+    if (s_phase != AUDIO_PHASE_REC && s_phase != AUDIO_PHASE_STARTING) return ESP_ERR_INVALID_STATE;
     s_req_stop = 1;
     __sync_synchronize();
     return wait_phase(AUDIO_PHASE_IDLE, ack_timeout_ms);
 }
 
 esp_err_t audio_io_start_playback(uint32_t ack_timeout_ms) {
+    return audio_io_start_playback_cancellable(ack_timeout_ms, NULL, NULL);
+}
+
+esp_err_t audio_io_start_playback_cancellable(uint32_t ack_timeout_ms,
+                                              audio_io_cancel_cb_t cancelled,
+                                              void *ctx) {
     if (!s_task) return ESP_ERR_INVALID_STATE;
-    if (s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE ||
+    taskENTER_CRITICAL(&s_control_lock);
+    if ((cancelled && cancelled(ctx)) || ring_cancelled() ||
+        s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE ||
         s_ring_role != RING_ROLE_SPK) {
+        taskEXIT_CRITICAL(&s_control_lock);
         return ESP_ERR_INVALID_STATE;
     }
     s_req_stop = 0;
     s_req_abort = 0;
-    __sync_synchronize();
+    s_phase = AUDIO_PHASE_STARTING;
     s_req_start = REQ_START_PLAY;
+    taskEXIT_CRITICAL(&s_control_lock);
     esp_err_t e = wait_phase(AUDIO_PHASE_PLAY, ack_timeout_ms);
     if (e != ESP_OK) {
-        s_req_start = REQ_NONE;
         audio_io_abort(2000);
     }
     return e;
@@ -412,41 +453,69 @@ esp_err_t audio_io_start_playback(uint32_t ack_timeout_ms) {
 
 esp_err_t audio_io_stop_playback(uint32_t ack_timeout_ms) {
     if (s_phase == AUDIO_PHASE_IDLE) return ESP_OK;
-    if (s_phase != AUDIO_PHASE_PLAY) return ESP_ERR_INVALID_STATE;
+    if (s_phase != AUDIO_PHASE_PLAY && s_phase != AUDIO_PHASE_STARTING) return ESP_ERR_INVALID_STATE;
     s_req_stop = 1;
     __sync_synchronize();
     return wait_phase(AUDIO_PHASE_IDLE, ack_timeout_ms);
 }
 
-void audio_io_abort(uint32_t timeout_ms) {
-    s_req_start = REQ_NONE;
+void audio_io_request_abort(void) {
+    taskENTER_CRITICAL(&s_control_lock);
+    __atomic_add_fetch(&s_epoch, 1, __ATOMIC_ACQ_REL);
     s_req_abort = 1;
     s_req_stop  = 1;
-    __sync_synchronize();
-    wait_phase(AUDIO_PHASE_IDLE, timeout_ms);
+    taskEXIT_CRITICAL(&s_control_lock);
+}
+
+void audio_io_set_suspended(bool suspended) {
+    taskENTER_CRITICAL(&s_control_lock);
+    __atomic_store_n(&s_suspended, suspended, __ATOMIC_RELEASE);
+    if (suspended) {
+        __atomic_add_fetch(&s_epoch, 1, __ATOMIC_ACQ_REL);
+        s_req_abort = 1;
+        s_req_stop = 1;
+    }
+    taskEXIT_CRITICAL(&s_control_lock);
+}
+
+void audio_io_abort(uint32_t timeout_ms) {
+    audio_io_request_abort();
+    if (timeout_ms) wait_phase(AUDIO_PHASE_IDLE, timeout_ms);
 }
 
 esp_err_t audio_io_prepare_speaker(uint32_t sample_rate, uint8_t channels) {
+    return audio_io_prepare_speaker_cancellable(sample_rate, channels, NULL, NULL);
+}
+
+esp_err_t audio_io_prepare_speaker_cancellable(uint32_t sample_rate, uint8_t channels,
+                                               audio_io_cancel_cb_t cancelled,
+                                               void *ctx) {
     if (sample_rate < 8000 || sample_rate > 96000 ||
         (channels != 1 && channels != 2)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
+    taskENTER_CRITICAL(&s_control_lock);
+    if ((cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
+        s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
+        taskEXIT_CRITICAL(&s_control_lock);
         return ESP_ERR_INVALID_STATE;
     }
     s_spk_sample_rate = sample_rate;
     s_spk_channels = channels;
     ring_reset(&s_ring);
     s_ring_role = RING_ROLE_SPK;
-    __sync_synchronize();
+    __atomic_store_n(&s_ring_epoch, __atomic_load_n(&s_epoch, __ATOMIC_RELAXED),
+                     __ATOMIC_RELEASE);
+    taskEXIT_CRITICAL(&s_control_lock);
     return ESP_OK;
 }
 
 size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms) {
-    if (s_ring_role != RING_ROLE_MIC) return 0;
+    if (ring_cancelled() || s_ring_role != RING_ROLE_MIC) return 0;
     if (timeout_ms == 0) return ring_read(&s_ring, dst, maxlen);
     int64_t t0 = now_ms();
     for (;;) {
+        if (ring_cancelled()) return 0;
         size_t n = ring_read(&s_ring, dst, maxlen);
         if (n) return n;
         if ((uint32_t)(now_ms() - t0) >= timeout_ms) return 0;
@@ -455,13 +524,14 @@ size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms) {
 }
 
 size_t audio_io_write_speaker(const uint8_t *src, size_t len, uint32_t timeout_ms) {
-    if (s_ring_role != RING_ROLE_SPK ||
+    if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
         (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
         return 0;
     }
     size_t total = 0;
     int64_t t0 = now_ms();
     while (total < len) {
+        if (ring_cancelled()) break;
         size_t pushed = ring_write(&s_ring, src + total, len - total);
         if (pushed) { total += pushed; t0 = now_ms(); continue; }
         if (timeout_ms == 0 || (uint32_t)(now_ms() - t0) >= timeout_ms) break;
@@ -472,15 +542,16 @@ size_t audio_io_write_speaker(const uint8_t *src, size_t len, uint32_t timeout_m
 
 size_t audio_io_reserve_speaker(uint8_t **dst, uint32_t timeout_ms) {
     if (!dst) return 0;
-    if (s_ring_role != RING_ROLE_SPK ||
+    if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
         (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
         return 0;
     }
     int64_t t0 = now_ms();
     for (;;) {
+        if (ring_cancelled()) return 0;
         size_t n = ring_write_acquire(&s_ring, dst);
         if (n) return n;
-        if (s_ring_role != RING_ROLE_SPK ||
+        if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
             (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
             return 0;
         }
@@ -491,7 +562,7 @@ size_t audio_io_reserve_speaker(uint8_t **dst, uint32_t timeout_ms) {
 
 void audio_io_commit_speaker(size_t n) {
     if (n == 0) return;
-    if (s_ring_role != RING_ROLE_SPK ||
+    if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
         (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
         return;
     }
@@ -504,8 +575,8 @@ bool     audio_io_spk_active(void)     { return s_phase == AUDIO_PHASE_PLAY; }
 uint32_t audio_io_mic_overflow(void)   { return s_mic_overflow_chunks; }
 uint32_t audio_io_spk_underrun(void)   { return s_spk_underrun; }
 size_t audio_io_mic_available(void) {
-    return s_ring_role == RING_ROLE_MIC ? ring_available(&s_ring) : 0;
+    return !ring_cancelled() && s_ring_role == RING_ROLE_MIC ? ring_available(&s_ring) : 0;
 }
 size_t audio_io_spk_free(void) {
-    return s_ring_role == RING_ROLE_SPK ? ring_free_space(&s_ring) : 0;
+    return !ring_cancelled() && s_ring_role == RING_ROLE_SPK ? ring_free_space(&s_ring) : 0;
 }

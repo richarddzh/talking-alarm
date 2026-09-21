@@ -19,6 +19,9 @@
 #include "gui_shell.h"
 #include "app_chat_alarm.h"
 #include "app_settings.h"
+#include "power_settings.h"
+#include "idle_power.h"
+#include "st7789.h"
 #include "app_radio.h"
 #include "app_tetris.h"
 #include "app_snake.h"
@@ -80,6 +83,15 @@ static volatile bool s_chime_status_dirty;
 static int64_t s_voice_face_hide_at_ms;
 static bool    s_face_was_visible;
 static chime_schedule_t s_chime_sched = { .hour_key = -1 };
+static idle_power_state_t s_power_state;
+static int64_t s_last_input_ms;
+static int64_t s_display_retry_ms;
+static int64_t s_setup_stop_retry_ms;
+static bool s_display_asleep;
+static bool s_consume_wake_input;
+static bool s_sleep_hourly_active;
+static bool s_resume_radio;
+static size_t s_resume_radio_station;
 
 static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -122,6 +134,7 @@ static bool voice_face_visible(void) {
 }
 
 static void render_home(void) {
+    if (s_power_state != IDLE_POWER_AWAKE) return;
     voice_face_t f = voice_face_for(voice_chat_status());
     gui_model_t model = {
         .date = s_last_time.ok ? s_last_time.date : "",
@@ -274,7 +287,13 @@ static bool ensure_wifi_connected(const char *reason) {
     snprintf(s_status_msg, sizeof(s_status_msg), "%s wifi...", reason);
     render_home();
 
-    if (wifi_time_connect() != ESP_OK) {
+    esp_err_t connect_result = s_power_state == IDLE_POWER_AWAKE ?
+                                  wifi_time_connect() : wifi_time_connect_async();
+    if (connect_result == ESP_ERR_NOT_FINISHED) {
+        s_last_wifi_retry_ms = now_ms();
+        return false;
+    }
+    if (connect_result != ESP_OK) {
         uint8_t disc_reason = wifi_time_last_disconnect_reason();
         const char *disc_text = wifi_time_last_disconnect_reason_text();
         ESP_LOGW(TAG, "wifi connect failed for %s: %u (%s)",
@@ -362,6 +381,9 @@ static void poll_rtc_time(void) {
 }
 
 static bool trigger_chime(const char *reason, const char *time_arg) {
+    if (s_power_state == IDLE_POWER_SLEEP && strcmp(reason, "hour chime") != 0) {
+        return false;
+    }
     if (voice_chat_busy() || chime_player_busy() || radio_player_busy() ||
         audio_io_phase() != AUDIO_PHASE_IDLE) {
         return false;
@@ -376,11 +398,15 @@ static bool trigger_chime(const char *reason, const char *time_arg) {
         return false;
     }
     if (!ensure_wifi_connected(reason)) return false;
+    bool sleeping = s_power_state == IDLE_POWER_SLEEP;
+    if (sleeping) audio_io_set_suspended(false);
     if (chime_player_start(time_arg) != ESP_OK) {
+        if (sleeping) audio_io_set_suspended(true);
         snprintf(s_status_msg, sizeof(s_status_msg), "chime busy");
         render_home();
         return false;
     }
+    if (sleeping) s_sleep_hourly_active = true;
     if (time_arg && time_arg[0]) {
         char message[48];
         snprintf(message, sizeof(message), "定时播报 %s", time_arg);
@@ -404,15 +430,27 @@ static void maybe_dispatch_scheduled_chime(void) {
         if (sec_of_hour >= HOUR_CHIME_WINDOW_SEC) {
             s_chime_sched.hourly_pending = false;
         } else {
-        char time_arg[16];
-        format_ampm_time(hour, 0, time_arg);
-        if (trigger_chime("hour chime", time_arg)) {
-            s_chime_sched.hourly_pending = false;
-        }
+            // Temporarily yield a screen-off radio to the hourly announcement.
+            if (s_power_state == IDLE_POWER_SCREEN_OFF && radio_player_busy()) {
+                if (!s_resume_radio) {
+                    radio_player_snapshot_t snapshot;
+                    radio_player_get_snapshot(&snapshot);
+                    s_resume_radio_station = snapshot.station_index;
+                    s_resume_radio = true;
+                    radio_player_request_stop();
+                }
+                return;
+            }
+            char time_arg[16];
+            format_ampm_time(hour, 0, time_arg);
+            if (trigger_chime("hour chime", time_arg)) {
+                s_chime_sched.hourly_pending = false;
+            }
         }
         return;
     }
 
+    if (s_power_state == IDLE_POWER_SLEEP) return;
     for (int i = 0; i < RANDOM_CHIME_COUNT; ++i) {
         if (s_chime_sched.fired[i]) continue;
         if (s_chime_sched.slots[i] > sec_of_hour) break;
@@ -425,8 +463,9 @@ static void maybe_dispatch_scheduled_chime(void) {
 
 // --- Wi-Fi setup AP -----------------------------------------------------
 static void set_setup_ap(bool on) {
-    if (on == s_setup_mode) return;
+    if (on == s_setup_mode && on == wifi_provision_active()) return;
     if (on) {
+        s_resume_radio = false;
         radio_player_stop(4000);
         wifi_time_disconnect();
         mem_log("ap pre");
@@ -443,7 +482,7 @@ static void set_setup_ap(bool on) {
             s_setup_mode = false;
             mem_log("ap off");
             snprintf(s_status_msg, sizeof(s_status_msg), "AP off");
-            if (wifi_time_has_credentials()) {
+            if (wifi_time_has_credentials() && s_power_state != IDLE_POWER_SLEEP) {
                 if (ensure_wifi_connected("setup off")) {
                     mem_log("wifi back");
                 }
@@ -451,9 +490,91 @@ static void set_setup_ap(bool on) {
         } else {
             s_setup_mode = true;
             snprintf(s_status_msg, sizeof(s_status_msg), "AP stop fail");
+            ESP_LOGE(TAG, "cannot stop setup AP");
         }
     }
     render_home();
+}
+
+static void update_idle_power(void) {
+    const power_settings_t *settings = power_settings_get();
+    idle_power_state_t target = idle_power_target(
+        s_power_state, now_ms() - s_last_input_ms,
+        settings->sleep_minutes, settings->screen_off_minutes);
+    if (target != s_power_state) {
+        s_power_state = target;
+        gui_shell_exit_game();
+        s_button_press_ms = 0;
+        s_button_long_handled = false;
+        if (target == IDLE_POWER_SLEEP) {
+            s_resume_radio = false;
+            s_sleep_hourly_active = false;
+            audio_io_set_suspended(true);
+            voice_chat_cancel();
+            chime_player_cancel();
+            radio_player_request_stop();
+            app_chat_alarm_set_recording(false, 0);
+        }
+        ESP_LOGI(TAG, "idle power: %s",
+                 target == IDLE_POWER_SLEEP ? "sleep" : "screen off");
+    }
+    if (s_power_state == IDLE_POWER_SLEEP &&
+        (s_setup_mode || wifi_provision_active()) &&
+        now_ms() >= s_setup_stop_retry_ms) {
+        set_setup_ap(false);
+        gui_shell_show_launcher();
+        s_setup_stop_retry_ms = now_ms() + APP_WIFI_RETRY_MS;
+    }
+    if (s_power_state != IDLE_POWER_AWAKE && !s_display_asleep &&
+        now_ms() >= s_display_retry_ms) {
+        esp_err_t err = st7789_set_sleep(true);
+        if (err == ESP_OK) {
+            s_display_asleep = true;
+        } else {
+            ESP_LOGE(TAG, "display sleep failed: %s", esp_err_to_name(err));
+            s_display_retry_ms = now_ms() + 1000;
+        }
+    }
+    if (s_power_state == IDLE_POWER_SLEEP && s_sleep_hourly_active &&
+        !chime_player_busy()) {
+        audio_io_set_suspended(true);
+        s_sleep_hourly_active = false;
+    }
+}
+
+static void wake_from_idle(void) {
+    // Retry SLPOUT even if SLPIN previously failed partway through.
+    esp_err_t err = st7789_set_sleep(false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "display wake failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_power_state = IDLE_POWER_AWAKE;
+    s_display_asleep = false;
+    s_display_retry_ms = 0;
+    s_sleep_hourly_active = false;
+    s_button_press_ms = 0;
+    s_button_long_handled = false;
+    s_last_input_ms = now_ms();
+    audio_io_set_suspended(false);
+    gui_shell_invalidate();
+    render_home();
+    ESP_LOGI(TAG, "idle power: awake");
+}
+
+static void maybe_resume_radio(void) {
+    if (!s_resume_radio || (s_chime_sched.hourly_pending && !s_quiet_mode) ||
+        audio_activity_busy()) {
+        return;
+    }
+    s_resume_radio = false;
+    if (s_power_state == IDLE_POWER_SLEEP) return;
+    esp_err_t err = radio_player_start(s_resume_radio_station);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "radio resume failed: %s", esp_err_to_name(err));
+        snprintf(s_status_msg, sizeof(s_status_msg), "radio resume failed");
+        render_home();
+    }
 }
 
 // --- Single-button gestures --------------------------------------------
@@ -471,6 +592,7 @@ static void dispatch_gui_action(gui_action_t action) {
         render_home();
         break;
     case GUI_ACTION_CHIME:
+        s_resume_radio = false;
         trigger_chime("app chat", NULL);
         break;
     case GUI_ACTION_TOGGLE_QUIET:
@@ -525,6 +647,7 @@ static void dispatch_gui_action(gui_action_t action) {
         sync_time_from_wifi("settings");
         break;
     case GUI_ACTION_START_VOICE:
+        s_resume_radio = false;
         if (voice_chat_busy() || chime_player_busy() || radio_player_busy() ||
             audio_io_phase() != AUDIO_PHASE_IDLE) {
             snprintf(s_status_msg, sizeof(s_status_msg), "audio busy");
@@ -550,6 +673,7 @@ static void dispatch_gui_action(gui_action_t action) {
         }
         break;
     case GUI_ACTION_RADIO_TOGGLE: {
+        s_resume_radio = false;
         size_t station = app_radio_selected_station();
         radio_player_snapshot_t snapshot;
         radio_player_get_snapshot(&snapshot);
@@ -656,6 +780,8 @@ static void initialise(void) {
     ESP_ERROR_CHECK(ui_init());
     ui_show_status("闲聊闹钟", "设备开启", "等待", "", "");
     ESP_ERROR_CHECK(wifi_creds_init());
+    esp_err_t power_error = power_settings_load();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(power_error);
 
     wifi_creds_t wc;
     int rc = wifi_creds_load(&wc);
@@ -702,6 +828,7 @@ static void initialise(void) {
     s_last_refresh_ms = now_ms();
     s_last_wifi_retry_ms = now_ms();
     s_last_mem_log_ms = now_ms();
+    s_last_input_ms = now_ms();
     mem_log("boot done");
 }
 
@@ -711,15 +838,29 @@ void app_main(void) {
 
     for (;;) {
         app_input_event_t ev;
-        if (buttons_poll(&ev)) {
+        bool event_ready = buttons_poll(&ev);
+        bool input_active = buttons_active();
+        if (event_ready || input_active) {
+            s_last_input_ms = now_ms();
+        }
+        idle_input_action_t input_action = idle_power_filter_input(
+            s_power_state, event_ready, input_active, &s_consume_wake_input);
+        if (input_action == IDLE_INPUT_WAKE) {
+            wake_from_idle();
+        } else if (input_action == IDLE_INPUT_DISPATCH) {
             snprintf(s_btn_msg, sizeof(s_btn_msg), "%s",
                      buttons_event_name(ev));
             ESP_LOGI(TAG, "%s", s_btn_msg);
             handle_input_event(ev);
             render_home();
         }
-        handle_button_long_press();
-        dispatch_gui_action(gui_shell_tick(now_ms()));
+        if (s_power_state == IDLE_POWER_AWAKE && !s_consume_wake_input) {
+            handle_button_long_press();
+        }
+        update_idle_power();
+        if (s_power_state == IDLE_POWER_AWAKE) {
+            dispatch_gui_action(gui_shell_tick(now_ms()));
+        }
         if (s_setup_mode) {
             poll_wifi_provision();
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -752,15 +893,16 @@ void app_main(void) {
             continue;
         }
 
-        if (!audio_activity_busy() &&
+        if (s_power_state != IDLE_POWER_SLEEP && !audio_activity_busy() &&
             !wifi_time_is_connected() &&
             (uint32_t)(now_ms() - s_last_wifi_retry_ms) >= APP_WIFI_RETRY_MS) {
             ensure_wifi_connected("auto");
         }
 
         maybe_dispatch_scheduled_chime();
+        maybe_resume_radio();
 
-        if (!audio_activity_busy() &&
+        if (s_power_state == IDLE_POWER_AWAKE && !audio_activity_busy() &&
             (uint32_t)(now_ms() - s_last_refresh_ms) >= APP_TIME_REFRESH_MS) {
             sync_time_from_wifi("hourly");
         }
