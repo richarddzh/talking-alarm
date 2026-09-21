@@ -1,4 +1,4 @@
-"""Host regression tests for the production C idle policy and SPIFFS settings.
+"""Host regression tests for production C inputs, idle policy and SPIFFS settings.
 
 Windows: python tools\\test_idle_power.py --clang <ESP-Clang bin\\clang.exe>
 Uses the installed compiler and Windows CRT; no device or extra packages.
@@ -30,14 +30,98 @@ class Settings(ctypes.Structure):
 
 def compile_library(clang, work):
     (work / "esp_err.h").write_text(
-        "typedef int esp_err_t;\n"
+        "#pragma once\ntypedef int esp_err_t;\n"
         "#define ESP_OK 0\n#define ESP_FAIL -1\n"
         "#define ESP_ERR_NOT_FOUND 0x105\n#define ESP_ERR_INVALID_ARG 0x102\n",
         encoding="ascii",
     )
     (work / "esp_log.h").write_text(
         "#define ESP_LOGE(tag, ...) ((void)(tag))\n"
-        "#define ESP_LOGW(tag, ...) ((void)(tag))\n",
+        "#define ESP_LOGW(tag, ...) ((void)(tag))\n"
+        "#define ESP_LOGI(tag, ...) ((void)(tag))\n",
+        encoding="ascii",
+    )
+    for header in ("driver/gpio.h", "esp_adc/adc_oneshot.h", "esp_timer.h"):
+        path = work / header
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#include "input_host.h"\n', encoding="ascii")
+    (work / "esp_check.h").write_text(
+        '#include "esp_err.h"\n'
+        '#define ESP_ERROR_CHECK(call) do { if ((call) != ESP_OK) '
+        '__builtin_trap(); } while (0)\n',
+        encoding="ascii",
+    )
+    (work / "input_host.h").write_text(
+        """#pragma once
+#include <stdint.h>
+#include "esp_err.h"
+typedef int gpio_num_t;
+typedef int adc_unit_t;
+typedef int adc_channel_t;
+typedef void *adc_oneshot_unit_handle_t;
+typedef struct {
+    uint64_t pin_bit_mask;
+    int mode, pull_up_en, pull_down_en, intr_type;
+} gpio_config_t;
+typedef struct { int unit_id, ulp_mode; } adc_oneshot_unit_init_cfg_t;
+typedef struct { int atten, bitwidth; } adc_oneshot_chan_cfg_t;
+#define ADC_UNIT_1 1
+#define ADC_UNIT_2 2
+#define ADC_ULP_MODE_DISABLE 0
+#define ADC_ATTEN_DB_12 12
+#define ADC_BITWIDTH_DEFAULT 0
+#define GPIO_MODE_INPUT 1
+#define GPIO_PULLUP_ENABLE 1
+#define GPIO_PULLDOWN_DISABLE 0
+#define GPIO_INTR_DISABLE 0
+int gpio_get_level(gpio_num_t pin);
+esp_err_t gpio_config(const gpio_config_t *config);
+esp_err_t adc_oneshot_io_to_channel(int pin, adc_unit_t *unit, adc_channel_t *channel);
+esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *config,
+                              adc_oneshot_unit_handle_t *handle);
+esp_err_t adc_oneshot_config_channel(adc_oneshot_unit_handle_t handle,
+                                    adc_channel_t channel,
+                                    const adc_oneshot_chan_cfg_t *config);
+esp_err_t adc_oneshot_read(adc_oneshot_unit_handle_t handle,
+                          adc_channel_t channel, int *raw);
+int64_t esp_timer_get_time(void);
+""",
+        encoding="ascii",
+    )
+    (work / "input_host.c").write_text(
+        """#include "input_host.h"
+static int levels[64];
+static int axes[64];
+static int64_t clock_us;
+void host_reset_inputs(void) {
+    for (int i = 0; i < 64; ++i) { levels[i] = 1; axes[i] = 2048; }
+    clock_us = 1000000;
+}
+void host_set_pin(int pin, int level) { levels[pin] = level; }
+void host_set_axis(int pin, int raw) { axes[pin] = raw; }
+void host_advance_ms(int ms) { clock_us += (int64_t)ms * 1000; }
+int gpio_get_level(gpio_num_t pin) { return levels[pin]; }
+esp_err_t gpio_config(const gpio_config_t *config) {
+    (void)config; return ESP_OK;
+}
+esp_err_t adc_oneshot_io_to_channel(int pin, adc_unit_t *unit, adc_channel_t *channel) {
+    *unit = ADC_UNIT_2; *channel = pin; return ESP_OK;
+}
+esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *config,
+                              adc_oneshot_unit_handle_t *handle) {
+    (void)config; *handle = (void *)1; return ESP_OK;
+}
+esp_err_t adc_oneshot_config_channel(adc_oneshot_unit_handle_t handle,
+                                    adc_channel_t channel,
+                                    const adc_oneshot_chan_cfg_t *config) {
+    (void)handle; (void)channel; (void)config; return ESP_OK;
+}
+esp_err_t adc_oneshot_read(adc_oneshot_unit_handle_t handle,
+                          adc_channel_t channel, int *raw) {
+    (void)handle; *raw = axes[channel]; return ESP_OK;
+}
+int64_t esp_timer_get_time(void) { return clock_us; }
+""",
         encoding="ascii",
     )
     (work / "errno.h").write_text(
@@ -68,7 +152,10 @@ def compile_library(clang, work):
     )
     exports = ("idle_power_target", "idle_power_filter_input",
                "power_settings_load", "power_settings_get",
-               "power_settings_valid", "power_settings_save")
+               "power_settings_valid", "power_settings_save",
+               "buttons_init", "buttons_poll", "buttons_active",
+               "host_reset_inputs", "host_set_pin", "host_set_axis",
+               "host_advance_ms")
     output = work / "idle_power.dll"
     subprocess.run(
         [str(clang), "--target=x86_64-pc-windows-msvc", "-fuse-ld=lld",
@@ -76,6 +163,7 @@ def compile_library(clang, work):
          "-Wall", "-Wextra", "-Werror", "-I", str(work),
          '-DAPP_SPIFFS_BASE_PATH="."',
          str(MAIN / "idle_power.c"), str(MAIN / "power_settings.c"),
+         str(MAIN / "buttons.c"), str(work / "input_host.c"),
          str(work / "crt.lib"), "-Wl,/noentry",
          *[f"-Wl,/export:{name}" for name in exports], "-o", str(output)],
         check=True, capture_output=True,
@@ -217,6 +305,91 @@ class PowerTests(unittest.TestCase):
         self.assertEqual(self.values(), (30, 10))
 
 
+class InputTests(unittest.TestCase):
+    lib = None
+
+    def setUp(self):
+        self.lib.host_reset_inputs()
+
+    def poll(self, elapsed_ms=0):
+        self.lib.host_advance_ms(elapsed_ms)
+        event = ctypes.c_int(-1)
+        return bool(self.lib.buttons_poll(ctypes.byref(event))), event.value
+
+    def set_button(self, pin, level):
+        self.lib.host_set_pin(pin, level)
+        self.poll()
+        return self.poll(61)
+
+    def test_boot_low_cannot_prevent_screen_off_or_wake_it(self):
+        for pin in (4, 21):
+            with self.subTest(pin=pin):
+                self.lib.host_reset_inputs()
+                self.lib.host_set_pin(pin, 0)
+                self.lib.buttons_init()
+                self.assertEqual(self.poll(60_000)[0], False)
+                self.assertFalse(self.lib.buttons_active())
+                state = self.lib.idle_power_target(AWAKE, 60_000, 0, 1)
+                self.assertEqual(state, SCREEN_OFF)
+                consume = ctypes.c_bool(False)
+                for _ in range(5):
+                    ready, _ = self.poll(1000)
+                    self.assertEqual(
+                        self.lib.idle_power_filter_input(
+                            state, ready, self.lib.buttons_active(),
+                            ctypes.byref(consume)),
+                        0,
+                    )
+
+    def test_buttons_work_after_boot_low_is_released(self):
+        for pin, press_event in ((4, 0), (21, 2)):
+            with self.subTest(pin=pin):
+                self.lib.host_reset_inputs()
+                self.lib.host_set_pin(pin, 0)
+                self.lib.buttons_init()
+                self.poll(200)
+                self.set_button(pin, 1)
+                self.assertFalse(self.lib.buttons_active())
+                self.assertEqual(self.set_button(pin, 0), (True, press_event))
+                self.assertTrue(self.lib.buttons_active())
+                self.poll(500)
+                self.assertTrue(self.lib.buttons_active())
+                self.set_button(pin, 1)
+                self.assertFalse(self.lib.buttons_active())
+
+    def test_suppressed_b_press_does_not_latch_activity(self):
+        self.lib.buttons_init()
+        self.poll(200)
+        self.lib.host_set_axis(20, 4095)
+        self.assertEqual(self.poll(), (True, 4))
+        self.assertEqual(self.set_button(21, 0)[0], False)
+        self.lib.host_set_axis(20, 2048)
+        self.assertFalse(self.poll()[0])
+        # B remains electrically low, but no B action was accepted.
+        self.assertFalse(self.lib.buttons_active())
+        self.assertFalse(self.poll(60_000)[0])
+        self.assertFalse(self.lib.buttons_active())
+
+    def test_stuck_b_does_not_block_wake_gesture_release(self):
+        self.lib.host_set_pin(21, 0)
+        self.lib.buttons_init()
+        self.poll(60_000)
+        consume = ctypes.c_bool(False)
+        ready, _ = self.set_button(4, 0)
+        self.assertEqual(self.lib.idle_power_filter_input(
+            SCREEN_OFF, ready, self.lib.buttons_active(), ctypes.byref(consume)), 2)
+        ready, _ = self.set_button(4, 1)
+        self.assertEqual(self.lib.idle_power_filter_input(
+            AWAKE, ready, self.lib.buttons_active(), ctypes.byref(consume)), 0)
+        ready, _ = self.poll()
+        self.lib.idle_power_filter_input(
+            AWAKE, ready, self.lib.buttons_active(), ctypes.byref(consume))
+        self.assertFalse(consume.value)
+        ready, _ = self.set_button(4, 0)
+        self.assertEqual(self.lib.idle_power_filter_input(
+            AWAKE, ready, self.lib.buttons_active(), ctypes.byref(consume)), 1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clang", type=Path, required=True)
@@ -234,9 +407,16 @@ def main():
             ctypes.c_int, ctypes.c_bool, ctypes.c_bool, ctypes.POINTER(ctypes.c_bool)]
         lib.power_settings_get.restype = ctypes.POINTER(Settings)
         lib.power_settings_save.argtypes = [ctypes.POINTER(Settings)]
+        lib.buttons_poll.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        lib.buttons_poll.restype = ctypes.c_bool
+        lib.buttons_active.restype = ctypes.c_bool
         PowerTests.lib = lib
+        InputTests.lib = lib
         result = unittest.TextTestRunner(verbosity=2).run(
-            unittest.defaultTestLoader.loadTestsFromTestCase(PowerTests))
+            unittest.TestSuite([
+                unittest.defaultTestLoader.loadTestsFromTestCase(PowerTests),
+                unittest.defaultTestLoader.loadTestsFromTestCase(InputTests),
+            ]))
         # Windows cannot delete a DLL while it is loaded.
         ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
         ctypes.windll.kernel32.FreeLibrary(lib._handle)

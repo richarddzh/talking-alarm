@@ -20,6 +20,7 @@ typedef struct {
     int pin;
     bool stable_pressed;
     bool last_reading_pressed;
+    bool active_press;
     int64_t last_change_us;
 } digital_button_t;
 
@@ -88,7 +89,12 @@ static void init_digital_button(digital_button_t *button, int pin,
     button->pin = pin;
     button->stable_pressed = read_pressed(pin);
     button->last_reading_pressed = button->stable_pressed;
+    button->active_press = false;
     button->last_change_us = now_us;
+    if (button->stable_pressed) {
+        ESP_LOGW(TAG, "GPIO%d low at boot; waiting for release before activity",
+                 pin);
+    }
 }
 
 void buttons_init(void) {
@@ -126,6 +132,7 @@ static bool poll_digital(digital_button_t *button,
         return false;
     }
     button->stable_pressed = reading;
+    button->active_press = reading;
     if (!reading && released_event < 0) return false;
     *event = reading ? pressed_event : released_event;
     return true;
@@ -185,7 +192,10 @@ static bool poll_joystick_button(bool axes_neutral,
     }
 
     s_joystick_button.stable_pressed = reading;
-    if (!reading) return false;
+    if (!reading) {
+        s_joystick_button.active_press = false;
+        return false;
+    }
 
     int64_t now_ms = now_us / 1000;
     bool neutral_stable =
@@ -199,6 +209,7 @@ static bool poll_joystick_button(bool axes_neutral,
         return false;
     }
 
+    s_joystick_button.active_press = true;
     *event = APP_INPUT_JOYSTICK_PRESSED;
     return true;
 }
@@ -253,8 +264,17 @@ bool buttons_pressed(void) {
 }
 
 bool buttons_active(void) {
-    return s_main.stable_pressed || s_joystick_button.stable_pressed ||
+    return s_main.active_press || s_joystick_button.active_press ||
            s_axis_x.active_direction != 0 || s_axis_y.active_direction != 0;
+}
+
+void buttons_log_state(void) {
+    ESP_LOGI(TAG, "input main_down=%d main_active=%d B_down=%d B_active=%d "
+                 "x=%d/%d dir=%d y=%d/%d dir=%d",
+             s_main.stable_pressed, s_main.active_press,
+             s_joystick_button.stable_pressed, s_joystick_button.active_press,
+             s_axis_x.last_raw, s_axis_x.center, s_axis_x.active_direction,
+             s_axis_y.last_raw, s_axis_y.center, s_axis_y.active_direction);
 }
 
 const char *buttons_event_name(app_input_event_t event) {

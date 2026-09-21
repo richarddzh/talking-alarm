@@ -19,6 +19,8 @@ void buttons_init(void);
 bool buttons_poll(app_input_event_t *event);
 
 bool buttons_pressed(void);
-// Includes held buttons and deflected axes, even between repeat events.
+// Includes confirmed held buttons and deflected axes, even between repeats.
+// Boot-time lows and rejected B presses do not count as user activity.
 bool buttons_active(void);
+void buttons_log_state(void);
 const char *buttons_event_name(app_input_event_t event);

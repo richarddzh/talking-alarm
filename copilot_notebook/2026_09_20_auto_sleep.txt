@@ -26,3 +26,14 @@ build应该使用powershell，环境：powershell.exe -NoExit -ExecutionPolicy B
 flash 到com6
 
 完成后，git commit push to remote main
+
+用户现场反馈（2026-09-21）：
+为什么电台播了一分钟还没有息屏？
+
+我希望屏幕不要开，我希望只听到声音，你有没有理解我的需求？
+
+我设置过了
+
+我设置了自动息屏1min，之后，打开电台，播放了几分钟， 没有息屏
+
+git commit and push to remote main

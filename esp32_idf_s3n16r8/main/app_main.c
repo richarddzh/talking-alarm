@@ -87,6 +87,7 @@ static idle_power_state_t s_power_state;
 static int64_t s_last_input_ms;
 static int64_t s_display_retry_ms;
 static int64_t s_setup_stop_retry_ms;
+static int64_t s_power_log_ms;
 static bool s_display_asleep;
 static bool s_consume_wake_input;
 static bool s_sleep_hourly_active;
@@ -498,6 +499,17 @@ static void set_setup_ap(bool on) {
 
 static void update_idle_power(void) {
     const power_settings_t *settings = power_settings_get();
+    if ((settings->sleep_minutes || settings->screen_off_minutes) &&
+        now_ms() - s_power_log_ms >= 30000) {
+        s_power_log_ms = now_ms();
+        ESP_LOGI(TAG, "power state=%d idle=%lldms sleep=%umin screen=%umin "
+                     "radio_busy=%d audio_playing=%d",
+                 (int)s_power_state, (long long)(now_ms() - s_last_input_ms),
+                 (unsigned)settings->sleep_minutes,
+                 (unsigned)settings->screen_off_minutes,
+                 radio_player_busy(), audio_io_phase() == AUDIO_PHASE_PLAY);
+        buttons_log_state();
+    }
     idle_power_state_t target = idle_power_target(
         s_power_state, now_ms() - s_last_input_ms,
         settings->sleep_minutes, settings->screen_off_minutes);
@@ -782,6 +794,10 @@ static void initialise(void) {
     ESP_ERROR_CHECK(wifi_creds_init());
     esp_err_t power_error = power_settings_load();
     ESP_ERROR_CHECK_WITHOUT_ABORT(power_error);
+    ESP_LOGI(TAG, "power settings: sleep=%umin screen=%umin backlight_gpio=%d",
+             (unsigned)power_settings_get()->sleep_minutes,
+             (unsigned)power_settings_get()->screen_off_minutes,
+             APP_TFT_BACKLIGHT_PIN);
 
     wifi_creds_t wc;
     int rc = wifi_creds_load(&wc);
