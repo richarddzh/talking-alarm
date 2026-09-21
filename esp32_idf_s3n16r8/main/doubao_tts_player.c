@@ -115,7 +115,13 @@ static esp_err_t maybe_start_playback(tts_stream_ctx_t *ctx, bool force) {
     if (is_cancelled(ctx)) return ESP_ERR_INVALID_STATE;
     if (!ctx->playback_started && ctx->total_pcm > 0 &&
         (force || ctx->total_pcm >= TTS_PREFILL_BYTES)) {
-        if (audio_io_start_playback_cancellable(1000, is_cancelled, ctx) != ESP_OK) return ESP_FAIL;
+        esp_err_t err = audio_io_start_playback_cancellable(1000, is_cancelled, ctx);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "playback start: %s phase=%d suspended=%d",
+                     esp_err_to_name(err), (int)audio_io_phase(),
+                     audio_io_is_suspended());
+            return err;
+        }
         ctx->playback_started = true;
         report_status(ctx, "playing tts");
     }
@@ -247,6 +253,8 @@ static esp_err_t finish_tts_json(tts_stream_ctx_t *ctx) {
 static esp_err_t tts_http_event(esp_http_client_event_t *e) {
     tts_stream_ctx_t *ctx = (tts_stream_ctx_t *)e->user_data;
     if (!ctx) return ESP_OK;
+    // HTTP data callbacks can continue after an earlier callback failed.
+    if (ctx->stream_error) return ESP_FAIL;
     if (is_cancelled(ctx)) {
         ctx->stream_error = true;
         return ESP_FAIL;

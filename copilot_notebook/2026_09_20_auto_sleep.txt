@@ -37,3 +37,7 @@ flash 到com6
 我设置了自动息屏1min，之后，打开电台，播放了几分钟， 没有息屏
 
 git commit and push to remote main
+
+闲聊闹钟的语音输出在唤醒后 不工作了！
+
+完成之后，git push

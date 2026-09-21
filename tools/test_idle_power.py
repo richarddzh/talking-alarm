@@ -28,11 +28,12 @@ class Settings(ctypes.Structure):
     ]
 
 
-def compile_library(clang, work):
+def prepare_host_environment(clang, work):
     (work / "esp_err.h").write_text(
         "#pragma once\ntypedef int esp_err_t;\n"
         "#define ESP_OK 0\n#define ESP_FAIL -1\n"
-        "#define ESP_ERR_NOT_FOUND 0x105\n#define ESP_ERR_INVALID_ARG 0x102\n",
+        "#define ESP_ERR_NOT_FOUND 0x105\n#define ESP_ERR_INVALID_ARG 0x102\n"
+        "#define ESP_ERR_INVALID_STATE 0x103\n#define ESP_ERR_TIMEOUT 0x107\n",
         encoding="ascii",
     )
     (work / "esp_log.h").write_text(
@@ -142,7 +143,8 @@ int64_t esp_timer_get_time(void) { return clock_us; }
     )
     (work / "crt.def").write_text(
         "LIBRARY msvcrt.dll\nEXPORTS\n"
-        "fopen\nfclose\nferror\nfscanf\nfprintf\nremove\nrename\n_errno\n",
+        "fopen\nfclose\nferror\nfscanf\nfprintf\nremove\nrename\n_errno\n"
+        "memset\nmemcpy\n",
         encoding="ascii",
     )
     subprocess.run(
@@ -150,6 +152,10 @@ int64_t esp_timer_get_time(void) { return clock_us; }
          "-d", str(work / "crt.def"), "-l", str(work / "crt.lib")],
         check=True, capture_output=True,
     )
+
+
+def compile_library(clang, work):
+    prepare_host_environment(clang, work)
     exports = ("idle_power_target", "idle_power_filter_input",
                "power_settings_load", "power_settings_get",
                "power_settings_valid", "power_settings_save",

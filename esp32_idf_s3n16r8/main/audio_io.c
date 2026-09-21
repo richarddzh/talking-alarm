@@ -181,20 +181,28 @@ static esp_err_t install_speaker(void) {
     if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
         audio_io_quiet_speaker_pins();
         ESP_LOGE(TAG, "spk init_std: %s", esp_err_to_name(err)); return err; }
-    err = i2s_channel_enable(s_spk_chan);
-    if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
-        audio_io_quiet_speaker_pins(); return err; }
     memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
-    size_t silence_written = 0;
-    err = i2s_channel_write(s_spk_chan, s_i2s_write_buf,
-                            sizeof(s_i2s_write_buf), &silence_written,
-                            20);
-    if (err != ESP_OK || silence_written != sizeof(s_i2s_write_buf)) {
-        i2s_channel_disable(s_spk_chan);
+    size_t silence_loaded = 0;
+    // A 512-frame DMA buffer takes 32 ms at 16 kHz. Preload before
+    // enabling instead of timing out waiting 20 ms for its first interrupt.
+    err = i2s_channel_preload_data(s_spk_chan, s_i2s_write_buf,
+                                   sizeof(s_i2s_write_buf), &silence_loaded);
+    if (err != ESP_OK || silence_loaded != sizeof(s_i2s_write_buf)) {
+        ESP_LOGE(TAG, "spk preload: %s bytes=%u/%u",
+                 esp_err_to_name(err), (unsigned)silence_loaded,
+                 (unsigned)sizeof(s_i2s_write_buf));
         i2s_del_channel(s_spk_chan);
         s_spk_chan = NULL;
         audio_io_quiet_speaker_pins();
         return err != ESP_OK ? err : ESP_FAIL;
+    }
+    err = i2s_channel_enable(s_spk_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "spk enable: %s", esp_err_to_name(err));
+        i2s_del_channel(s_spk_chan);
+        s_spk_chan = NULL;
+        audio_io_quiet_speaker_pins();
+        return err;
     }
     s_spk_installed = true;
     mem_log("spk install");

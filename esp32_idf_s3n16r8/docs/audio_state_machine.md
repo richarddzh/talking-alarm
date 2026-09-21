@@ -72,6 +72,9 @@ IDLE -> STARTING -> PLAY -> IDLE
 - 录音开始时重置 ring 并设置为 `MIC`；TTS 连接建立后显式清空 ring 并设置
   为 `SPK`，随后才允许预填充和启动播放。
 - mic API 和 speaker API 都检查 ring role，避免状态错误时交叉破坏数据。
+- 扬声器启用前用 `i2s_channel_preload_data()` 预装静音 DMA，随后再开启
+  I2S。16 kHz 语音的 512-frame DMA 周期为 32 ms，不能用仅 20 ms 的首次
+  `i2s_channel_write()` 等待启动，否则电台能播放而 TTS 启动会超时。
 
 ## 语音完整时序
 
@@ -106,6 +109,7 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
 - 录音停止失败：请求 abort、关闭 ASR，Voice 进入 `ERROR`。
 - Agent 失败：此时录音已经停止且 `audio_io` 为 `IDLE`，直接进入 `ERROR`。
 - TTS HTTP/解析失败：若 PLAY 已启动，先停止播放；停止超时则 abort。
+  首次流错误被锁存，后续 HTTP 数据回调不再尝试启动播放或重复解析报错。
 - 播放排空超时：abort 后返回失败，业务状态进入 `ERROR`。
 - `audio_io` 启动确认超时：清除尚未消费的启动请求并发送 stop/abort。
   Core 1 取请求和超时取消发生竞争时，audio task 不再清除取消标志，因此
@@ -141,6 +145,11 @@ I/O 返回或超时后自行清理，不强行删除任务或从其他线程关�
 7. SoftAP 配置模式不会启动或泵送任何音频业务。
 
 ## 关键代码位置
+
+Windows 主机回归可运行
+`python tools\test_audio_startup.py --clang <ESP-Clang目录>\bin\clang.exe`
+（仓库根目录）。测试编译实际 `audio_io.c`，模拟不同采样率的首次 DMA
+中断时机，并覆盖静音预装失败、部分预装、启用失败后的清理与重试。
 
 | 文件 | 重点 |
 |---|---|
