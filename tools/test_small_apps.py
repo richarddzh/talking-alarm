@@ -72,8 +72,8 @@ int host_school_test(void) {
                   speed>=11.9f && speed<=32.1f)) return 0;
         }
     }
-    activate(2);
-    if (tick(50000)!=GUI_ACTION_NONE) return 0;
+    if (tick(50000)!=GUI_ACTION_NONE ||
+        tick(50066)!=GUI_ACTION_REDRAW) return 0;
     while (s_count>FISH_STEP) activate(0);
     activate(0);
     int ok=s_count==FISH_STEP;

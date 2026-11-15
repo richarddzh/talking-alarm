@@ -13,14 +13,14 @@
 #define FISH_MAX 32
 #define FISH_STEP 1
 #define FRAME_MS 66
-#define TANK_LEFT 22.0f
-#define TANK_RIGHT 298.0f
-#define TANK_TOP 55.0f
-#define TANK_BOTTOM 148.0f
-#define TANK_X 6
-#define TANK_Y 37
-#define TANK_W 308
-#define TANK_H 129
+#define TANK_X 4
+#define TANK_Y 34
+#define TANK_W 312
+#define TANK_H 172
+#define TANK_LEFT (TANK_X + FISH_ORANGE_W / 2.0f + 2.0f)
+#define TANK_RIGHT (TANK_X + TANK_W - FISH_ORANGE_W / 2.0f - 2.0f)
+#define TANK_TOP (TANK_Y + FISH_ORANGE_H / 2.0f + 6.0f)
+#define TANK_BOTTOM (TANK_Y + TANK_H - FISH_ORANGE_H / 2.0f - 12.0f)
 
 typedef struct {
     float x, y;
@@ -36,7 +36,6 @@ typedef struct {
 static const char *TAG = "aquarium";
 static school_t *s_school;
 static int s_count = 12;
-static bool s_paused;
 static int64_t s_last_frame_ms;
 static unsigned s_frame;
 
@@ -63,7 +62,6 @@ static void enter(void) {
     }
     for (int i = 0; i < s_count; ++i) add_fish(i);
     s_last_frame_ms = 0;
-    s_paused = false;
     s_frame = 0;
 }
 
@@ -138,7 +136,7 @@ static void step_school(float dt) {
 }
 
 static gui_action_t tick(int64_t now_ms) {
-    if (!s_school || s_paused) return GUI_ACTION_NONE;
+    if (!s_school) return GUI_ACTION_NONE;
     if (s_last_frame_ms == 0) s_last_frame_ms = now_ms;
     int64_t elapsed = now_ms - s_last_frame_ms;
     if (elapsed < FRAME_MS) return GUI_ACTION_NONE;
@@ -181,18 +179,21 @@ static void render(const gui_model_t *model, int focused_item) {
     ui_draw_text(12, 8, "小鱼缸", 2, UI_COLOR_TEXT);
     char count[32];
     snprintf(count, sizeof(count), "%d / %d 条", s_count, FISH_MAX);
-    ui_draw_text(224, 11, count, 1, UI_COLOR_CYAN);
-    ui_fill_round_rect(6, 37, 308, 129, 8, UI_COLOR_PRIMARY_DARK);
-    ui_draw_line(16, 43, 304, 43, UI_COLOR_CYAN);
-    ui_fill_rect(13, 155, 294, 6, UI_COLOR_WARNING);
+    ui_draw_text(132, 10, count, 1, UI_COLOR_CYAN);
+    ui_fill_round_rect(TANK_X, TANK_Y, TANK_W, TANK_H, 8, UI_COLOR_PRIMARY_DARK);
+    ui_draw_line(TANK_X + 10, TANK_Y + 6,
+                 TANK_X + TANK_W - 10, TANK_Y + 6, UI_COLOR_CYAN);
+    int floor_y = TANK_Y + TANK_H - 10;
+    ui_fill_rect(TANK_X + 7, floor_y, TANK_W - 14, 6, UI_COLOR_WARNING);
     for (int i = 0; i < 5; ++i) {
         int x = 28 + i * 64;
-        ui_draw_line(x, 155, x - 5, 137, UI_COLOR_SUCCESS);
-        ui_draw_line(x, 155, x + 6, 132, UI_COLOR_SUCCESS);
-        ui_draw_line(x + 2, 150, x + 12, 140, UI_COLOR_SUCCESS);
+        ui_draw_line(x, floor_y, x - 5, floor_y - 18, UI_COLOR_SUCCESS);
+        ui_draw_line(x, floor_y, x + 6, floor_y - 23, UI_COLOR_SUCCESS);
+        ui_draw_line(x + 2, floor_y - 5, x + 12, floor_y - 15, UI_COLOR_SUCCESS);
     }
     for (int i = 0; i < 6; ++i) {
-        int y = 148 - (int)((s_frame * 2 + (unsigned)i * 23) % 98);
+        int y = floor_y - 8 -
+                (int)((s_frame * 2 + (unsigned)i * 23) % (TANK_H - 36));
         int x = 18 + i * 55;
         ui_fill_circle(x, y, 2, UI_COLOR_CYAN);
         ui_set_pixel(x, y, UI_COLOR_PRIMARY_DARK);
@@ -200,15 +201,15 @@ static void render(const gui_model_t *model, int focused_item) {
     if (!s_school) {
         ui_draw_text(65, 92, "内存不足，请返回后重试", 1, UI_COLOR_DANGER);
     }
-    const char *labels[] = {"减少", "增加", s_paused ? "继续" : "暂停"};
-    for (int i = 0; i < 3; ++i) {
-        int x = 12 + i * 103;
+    const char *labels[] = {"-", "+"};
+    for (int i = 0; i < 2; ++i) {
+        int x = 236 + i * 42;
         bool focus = focused_item == i;
-        ui_fill_round_rect(x, 174, 90, 28, 5,
+        ui_fill_round_rect(x, 5, 32, 22, 4,
                            focus ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL);
-        ui_draw_rect(x, 174, 90, 28, focus ? 2 : 1,
+        ui_draw_rect(x, 5, 32, 22, focus ? 2 : 1,
                      focus ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-        ui_draw_text(x + 29, 182, labels[i], 1,
+        ui_draw_text(x + 10, 9, labels[i], 2,
                      focus ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     }
 }
@@ -220,24 +221,19 @@ static gui_action_t activate(uint8_t item) {
         for (int i = s_count; i < s_count + FISH_STEP; ++i) add_fish(i);
         s_count += FISH_STEP;
     }
-    if (item == 2) {
-        s_paused = !s_paused;
-        s_last_frame_ms = 0;
-    }
     return GUI_ACTION_REDRAW;
 }
 
 static const gui_focus_node_t s_focus_grid[] = {
     {.left = GUI_FOCUS_HOME, .right = 1, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
-    {.left = 0, .right = 2, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
-    {.left = 1, .right = GUI_FOCUS_HOME, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
+    {.left = 0, .right = GUI_FOCUS_HOME, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
 };
 
 static const gui_app_t s_app = {
     .id = "aquarium",
     .label = "小鱼缸",
     .icon = GUI_ICON_AQUARIUM,
-    .focus_count = 3,
+    .focus_count = 2,
     .focus_grid = s_focus_grid,
     .enter = enter,
     .exit = exit_app,
