@@ -3,11 +3,10 @@
 //
 // Drives I2S0 (ICS-43432 mic) during RECORD, then I2S1 (MAX98357A
 // speaker) during PLAY. The two phases never overlap, so a single
-// shared 64 KB DRAM arena is reused as either the mic ring (producer =
-// audio task, consumer = main) or the speaker ring (producer = a Core-0
-// worker, consumer = audio task). Recording resets the ring before REC;
-// TTS explicitly clears and assigns it to speaker use before prefill.
-// The underlying storage is never freed.
+// phase-owned PSRAM ring uses 64 KB for microphone capture (producer =
+// audio task, consumer = a Core-0 worker) or 256 KB for speaker PCM
+// (producer = a Core-0 worker, consumer = audio task).
+// I2S DMA and staging remain in DRAM. The underlying storage is never freed.
 //
 // Phase machine:
 //   IDLE  --start_recording-->  REC   (audio task fills mic ring)
@@ -27,8 +26,22 @@ typedef enum {
     AUDIO_PHASE_STARTING = 3,
 } audio_phase_t;
 
+typedef enum {
+    AUDIO_OWNER_NONE = 0,
+    AUDIO_OWNER_VOICE,
+    AUDIO_OWNER_CHIME,
+    AUDIO_OWNER_RADIO,
+} audio_io_owner_t;
+
 esp_err_t audio_io_init(void);
 esp_err_t audio_io_quiet_speaker_pins(void);
+
+// Acquire before network work, not just before REC/PLAY or prefill.
+// Retain across phase changes. Release only after all producers and their
+// network/decoder resources have stopped. Pending DMA teardown still blocks
+// the next acquisition until IDLE. Cancellation never releases ownership.
+esp_err_t audio_io_acquire_owner(audio_io_owner_t owner);
+void audio_io_release_owner(audio_io_owner_t owner);
 
 esp_err_t audio_io_start_recording(uint32_t ack_timeout_ms);
 esp_err_t audio_io_stop_recording(uint32_t ack_timeout_ms);

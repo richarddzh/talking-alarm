@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 static const char *TAG = "chime";
 
@@ -49,8 +51,7 @@ void chime_player_cancel(void) {
 static bool begin_job(void) {
     taskENTER_CRITICAL(&s_lock);
     bool allowed = !__atomic_load_n(&s_busy, __ATOMIC_RELAXED) &&
-                   !audio_io_is_suspended() &&
-                   audio_io_phase() == AUDIO_PHASE_IDLE;
+                   audio_io_acquire_owner(AUDIO_OWNER_CHIME) == ESP_OK;
     if (allowed) {
         __atomic_store_n(&s_cancelled, false, __ATOMIC_RELEASE);
         __atomic_store_n(&s_busy, true, __ATOMIC_RELEASE);
@@ -111,21 +112,27 @@ done:
             audio_io_abort(2000);
             set_status(CHIME_IDLE, "chime cancelled");
         } else if (err != ESP_OK) {
+            audio_io_abort(2000);
             ESP_LOGE(TAG, "chime err=%s", esp_err_to_name(err));
             set_status(CHIME_ERROR, "chime fail");
         } else {
             set_status(CHIME_DONE, "chime done");
         }
+        audio_io_release_owner(AUDIO_OWNER_CHIME);
         __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
     }
 }
 
 esp_err_t chime_player_init(void) {
     if (s_worker_task) return ESP_OK;
-    BaseType_t ok = xTaskCreatePinnedToCore(chime_worker, "chime_worker",
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(chime_worker, "chime_worker",
                                             6144, NULL, CHIME_TASK_PRIO,
-                                            &s_worker_task, CHIME_TASK_CORE);
-    if (ok != pdPASS) return ESP_FAIL;
+                                            &s_worker_task, CHIME_TASK_CORE,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "chime PSRAM task creation failed");
+        return ESP_ERR_NO_MEM;
+    }
     set_status(CHIME_IDLE, "chime ready");
     return ESP_OK;
 }

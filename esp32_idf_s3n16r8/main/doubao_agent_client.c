@@ -7,6 +7,7 @@
 #include <string.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 
 static const char *TAG = "doubao_agent";
@@ -65,7 +66,7 @@ static char *json_escape_alloc(const char *src) {
         }
     }
 
-    char *out = malloc(cap);
+    char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out) return NULL;
     char *w = out;
     for (const unsigned char *p = (const unsigned char *)src; p && *p; ++p) {
@@ -91,7 +92,7 @@ static char *json_escape_alloc(const char *src) {
 }
 
 static char *json_unescape_alloc(const char *src, size_t len) {
-    char *out = malloc(len + 1);
+    char *out = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out) return NULL;
     char *w = out;
     for (size_t i = 0; i < len; ++i) {
@@ -209,7 +210,8 @@ static char *build_agent_body(const char *prompt) {
         return NULL;
     }
 
-    char *body = malloc((size_t)len + 1);
+    char *body = heap_caps_malloc((size_t)len + 1,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
         free(escaped_prompt);
         return NULL;
@@ -238,7 +240,8 @@ static esp_err_t doubao_agent_request(const char *prompt, char **out_text) {
     if (!body) return ESP_ERR_NO_MEM;
 
     agent_http_ctx_t ctx = {
-        .data = calloc(1, AGENT_RESPONSE_MAX_BYTES + 1),
+        .data = heap_caps_calloc(1, AGENT_RESPONSE_MAX_BYTES + 1,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
     };
     if (!ctx.data) {
         free(body);

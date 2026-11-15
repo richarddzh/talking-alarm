@@ -37,6 +37,13 @@ audio_io_phase() == IDLE
 
 因此语音、chime 和底层 I2S 不会并行占用共享音频资源。
 
+底层还用 `audio_io_acquire_owner()` 原子领取 Voice/Chime/Radio 的整个会话。
+领取发生在网络连接前，覆盖阶段间的 IDLE、Agent 等待和 PCM 预填充。
+`IDLE` 只说明当前没有 I2S 活动，不代表没有业务占用共享 arena。
+start/prepare/读写入口要求已有 owner；全部网络句柄、decoder 和辅助 reader
+清理后，worker 释放 owner，再清除 busy。取消、暂停和唤醒不自动释放 owner。
+release 不停止 DMA；若 DMA 仍在退出，phase 会继续阻止下一次领取。
+
 ### Voice/Chime 业务状态
 
 Voice 状态：
@@ -68,10 +75,13 @@ IDLE -> STARTING -> PLAY -> IDLE
 - `STARTING`：启动请求已被接受或正在安装 I2S，不可误判为可复用的 IDLE。
 - `REC`：Core 1 是 mic ring 生产者，`voice_worker` 是消费者。
 - `PLAY`：TTS 所在的 Core 0 worker 是 speaker ring 生产者，Core 1 是消费者。
-- REC 和 PLAY 不重叠；同一块 64 KB arena 按 `MIC`/`SPK` role 复用。
+- REC 和 PLAY 不重叠；同一块 256 KB PSRAM arena 按 `MIC`/`SPK` role 复用，
+  REC 有效容量为前 64 KB，PLAY 为全部 256 KB。
 - 录音开始时重置 ring 并设置为 `MIC`；TTS 连接建立后显式清空 ring 并设置
   为 `SPK`，随后才允许预填充和启动播放。
 - mic API 和 speaker API 都检查 ring role，避免状态错误时交叉破坏数据。
+- REC/PLAY 共用一个 2 KB 内部 SRAM union 搬运区，降采样另用 512 B；
+  Core 0 网络 worker 栈使用 PSRAM，Core 1 实时音频栈和 DMA 留在内部 SRAM。
 - 扬声器启用前用 `i2s_channel_preload_data()` 预装静音 DMA，随后再开启
   I2S。16 kHz 语音的 512-frame DMA 周期为 32 ms，不能用仅 20 ms 的首次
   `i2s_channel_write()` 等待启动，否则电台能播放而 TTS 启动会超时。
@@ -91,6 +101,8 @@ IDLE -> STARTING -> PLAY -> IDLE
    预填 PCM，达到 32 KB 或响应结束时请求 Core 1 进入 `PLAY`。
 8. 响应结束后请求 `stop_playback()`；Core 1 排空 ring、等待 DMA 尾音、
    卸载扬声器并确认 `IDLE`，随后 Voice 才进入 `DONE`。
+9. ASR session 关闭时释放固定 TX/RX 工作区；识别结果在 finish 时已转移给
+   Voice，由 Voice 释放。业务清理完毕后释放 owner，再清除 busy。
 
 ## Chime 时序
 
@@ -149,7 +161,10 @@ I/O 返回或超时后自行清理，不强行删除任务或从其他线程关�
 Windows 主机回归可运行
 `python tools\test_audio_startup.py --clang <ESP-Clang目录>\bin\clang.exe`
 （仓库根目录）。测试编译实际 `audio_io.c`，模拟不同采样率的首次 DMA
-中断时机，并覆盖静音预装失败、部分预装、启用失败后的清理与重试。
+中断时机，并覆盖静音预装失败、部分预装、启用失败后的清理与重试，
+以及连接/取消期间 owner 互斥和 REC/PLAY 的共享存储切换。
+
+内存分配、复用和新 App 接入规范见 [memory_analysis.md](memory_analysis.md)。
 
 | 文件 | 重点 |
 |---|---|

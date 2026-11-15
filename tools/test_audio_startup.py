@@ -15,6 +15,15 @@ from test_idle_power import MAIN, prepare_host_environment
 
 def compile_audio_library(clang, work):
     prepare_host_environment(clang, work)
+    with (work / "esp_err.h").open("a", encoding="ascii") as header:
+        header.write("#define ESP_ERR_NO_MEM 0x101\n")
+    (work / "esp_heap_caps.h").write_text(
+        "#include <stddef.h>\n#define MALLOC_CAP_SPIRAM 1\n"
+        "#define MALLOC_CAP_8BIT 2\n"
+        "void *heap_caps_malloc(size_t, unsigned);\n"
+        "void heap_caps_free(void *);\n",
+        encoding="ascii",
+    )
     (work / "esp_log.h").write_text(
         "void host_log(const char *, const char *, ...);\n"
         "const char *esp_err_to_name(int);\n"
@@ -97,7 +106,13 @@ esp_err_t i2s_channel_read(i2s_chan_handle_t, void *, size_t, size_t *, uint32_t
     )
     (work / "audio_host.c").write_text(
         """#include "audio_io.c"
+static uint8_t speaker_buffer[APP_SPEAKER_BUFFER_BYTES];
+void *heap_caps_malloc(size_t size, unsigned caps) {
+    (void)caps; return size <= sizeof(speaker_buffer) ? speaker_buffer : NULL;
+}
+void heap_caps_free(void *buffer) { (void)buffer; }
 static unsigned rate, frames;
+static int record_once;
 static int injected_failure, enabled, preloads, writes, deletes, enables;
 static int invalid_order;
 void host_advance_ms(int ms);
@@ -155,6 +170,13 @@ esp_err_t i2s_channel_write(i2s_chan_handle_t h, const void *src,
 esp_err_t i2s_channel_read(i2s_chan_handle_t h, void *dst,
                           size_t size, size_t *read, uint32_t timeout_ms) {
     (void)h; (void)dst; (void)size; (void)timeout_ms;
+    if (record_once) {
+        memset(dst, 0, size);
+        *read = size;
+        record_once = 0;
+        s_req_stop = 1;
+        return ESP_OK;
+    }
     *read = 0; return ESP_ERR_TIMEOUT;
 }
 int test_install_after_wake(unsigned sample_rate, unsigned channels, int failure) {
@@ -163,11 +185,45 @@ int test_install_after_wake(unsigned sample_rate, unsigned channels, int failure
     enabled = preloads = writes = deletes = enables = invalid_order = 0;
     audio_io_set_suspended(true);
     audio_io_set_suspended(false);
-    esp_err_t err = audio_io_prepare_speaker(sample_rate, (uint8_t)channels);
+    esp_err_t err = audio_io_acquire_owner(AUDIO_OWNER_VOICE);
     if (err != ESP_OK) return err;
-    err = install_speaker();
+    err = audio_io_prepare_speaker(sample_rate, (uint8_t)channels);
+    if (err == ESP_OK) err = install_speaker();
     if (err == ESP_OK) uninstall_speaker();
+    audio_io_release_owner(AUDIO_OWNER_VOICE);
     return err;
+}
+int test_owner_exclusive_during_connect_and_cancel(void) {
+    audio_io_init();
+    if (audio_io_acquire_owner(AUDIO_OWNER_VOICE) != ESP_OK) return 0;
+    if (audio_io_acquire_owner(AUDIO_OWNER_RADIO) == ESP_OK) return 0;
+    audio_io_set_suspended(true);
+    audio_io_set_suspended(false);
+    if (audio_io_acquire_owner(AUDIO_OWNER_CHIME) == ESP_OK) return 0;
+    s_phase = AUDIO_PHASE_STARTING;
+    audio_io_release_owner(AUDIO_OWNER_VOICE);
+    if (audio_io_acquire_owner(AUDIO_OWNER_CHIME) == ESP_OK) return 0;
+    finish_phase();
+    if (audio_io_acquire_owner(AUDIO_OWNER_CHIME) != ESP_OK) return 0;
+    audio_io_release_owner(AUDIO_OWNER_CHIME);
+    return 1;
+}
+int test_record_and_play_share_storage(void) {
+    audio_io_init();
+    if (audio_io_acquire_owner(AUDIO_OWNER_VOICE) != ESP_OK) return 0;
+    injected_failure = 0;
+    s_req_stop = s_req_abort = 0;
+    record_once = 1;
+    do_recording();
+    uint8_t *storage = s_ring.buf;
+    int correct = ring_capacity(&s_ring) == APP_AUDIO_ARENA_BYTES &&
+                  ring_available(&s_ring) == 512;
+    correct = correct && audio_io_prepare_speaker(44100, 2) == ESP_OK &&
+              s_ring.buf == storage && storage == s_audio_arena &&
+              ring_capacity(&s_ring) == APP_SPEAKER_BUFFER_BYTES &&
+              ring_available(&s_ring) == 0;
+    audio_io_release_owner(AUDIO_OWNER_VOICE);
+    return correct;
 }
 int test_preloads(void) { return preloads; }
 int test_writes(void) { return writes; }
@@ -178,7 +234,9 @@ int test_clean(void) { return !enabled && !s_spk_installed && !s_spk_chan && !in
         encoding="ascii",
     )
     exports = ("test_install_after_wake", "test_preloads", "test_writes",
-               "test_deletes", "test_enables", "test_clean")
+               "test_deletes", "test_enables", "test_clean",
+               "test_owner_exclusive_during_connect_and_cancel",
+               "test_record_and_play_share_storage")
     output = work / "audio_startup.dll"
     subprocess.run(
         [str(clang), "--target=x86_64-pc-windows-msvc", "-fuse-ld=lld",
@@ -194,6 +252,12 @@ int test_clean(void) { return !enabled && !s_spk_installed && !s_spk_chan && !in
 
 class AudioStartupTests(unittest.TestCase):
     lib = None
+
+    def test_owner_excludes_other_sessions_before_playback_and_until_teardown(self):
+        self.assertEqual(self.lib.test_owner_exclusive_during_connect_and_cancel(), 1)
+
+    def test_record_and_play_use_one_psram_allocation_and_reset_contents(self):
+        self.assertEqual(self.lib.test_record_and_play_share_storage(), 1)
 
     def test_speech_and_radio_start_after_wake(self):
         for rate in (8000, 16000, 22050, 44100, 48000, 96000):

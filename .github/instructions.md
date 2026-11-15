@@ -16,6 +16,20 @@
 - 对于小型测试草图，避免引入不必要的库封装或多文件抽象。
 - 如果某个草图依赖特定硬件细节，请将这些信息明确写在文件顶部附近。
 
+## ESP32-S3 固件内存与音频
+
+- 修改 `esp32_idf_s3n16r8/` 前遵循 `docs/memory_analysis.md` 的当前内存、
+  所有权和生命周期约定，并同步直接相关文档。
+- 大工作区、网络对象和非实时 Core 0 worker 栈显式使用 PSRAM；
+  不依赖普通 `malloc()`，不在分配失败时静默回退占用内部堆。
+- Core 1 仅服务实时音频；I2S/SPI DMA、实时搬运区和音频任务栈保留内部 SRAM。
+- 音频业务必须在网络连接前领取 `audio_io` owner，全部生产者和句柄清理后
+  释放，再清除 busy；phase 为 IDLE 不代表会话资源空闲。
+- 只复用生命周期互斥的缓冲；ring 容量必须为 2 的幂，REC 不超过共享 arena，
+  预填充为下一帧留出空间。WithCaps 创建的退出型任务必须 WithCaps 删除。
+- 以实际生成 sdkconfig、ELF 和能力堆日志验证预算；不得把 PSRAM 总空闲当作
+  DMA 余量，也不得凭感觉缩小任务栈。
+
 ## Python 脚本
 
 - 共享的 Python 环境位于 `python_scripts/.venv/`。

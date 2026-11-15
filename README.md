@@ -91,8 +91,8 @@ esp32_idf_s3n16r8/
 | Y | 19 | ADC | 上/下移动 |
 | 主按钮 | 4 | 数字低电平 | 短按确认；闲聊 App 长按录音 |
 
-ADC 启动时自动采样中心值，并使用按下死区、释放迟滞、首次重复延迟和连续
-重复间隔。需要反转安装方向时，修改 `APP_JOYSTICK_X_INVERTED` 或
+ADC 启动时自动采样中心值，并使用按下死区、释放迟滞和 40 ms 方向防抖；
+持续拨动 500 ms 后才连发，每 250 ms 移动一次。需要反转安装方向时，修改 `APP_JOYSTICK_X_INVERTED` 或
 `APP_JOYSTICK_Y_INVERTED`。当前硬件的 Y 轴已启用反转，使物理向上对应
 GUI 的向上事件。GPIO19/20 已专用于 ADC，因此固件使用 UART
 控制台，不启用占用同一组引脚的原生 USB Serial/JTAG 控制台。
@@ -124,3 +124,7 @@ idf.py -p COM6 flash monitor
 3. 实现 `tick/render/activate/handle_input`，不要在 App 中读取原始 GPIO。
 4. 在 `app_main.c` 注册描述符，并在 `main/CMakeLists.txt` 添加源文件。
 5. 耗时网络工作放在 Core 0 worker；不要改变 Core 1 音频任务优先级。
+6. 大缓冲、网络对象和非实时 worker 栈显式分配到 PSRAM；使用音频前领取
+   owner，全部资源清理后释放。DMA 和实时搬运区保留在内部 SRAM。
+   具体生命周期和复用约定见
+   [`内存与音频资源约定`](esp32_idf_s3n16r8/docs/memory_analysis.md)。

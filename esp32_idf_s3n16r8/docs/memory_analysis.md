@@ -1,229 +1,173 @@
-# ESP32 Wi-Fi Alarm (esp-idf) 内存与音频缓冲分析
+# ESP32-S3 内存与音频资源约定
 
-> 适用项目：`esp32_wifi_alarm_idf`
-> 目标：录音 + 上传 + 下载 + 播放全链路流畅
-> 注：所有数值为基于源码 + sdkconfig 的**静态估算**，未实际构建。精确值请在构建后用 `idf.py size / size-components / size-files` 和运行时 `esp_get_free_heap_size()` 验证。
+适用工程：`esp32_idf_s3n16r8`，硬件为 ESP32-S3 N16R8：
+512 KB SRAM、8 MB Octal PSRAM、16 MB Flash。
+本文描述当前实现，也是新增 App、音频业务和网络 worker 的接入约定。
+容量中的 KB 按 1024 字节计算；运行时预算须核对实际构建配置和日志。
 
----
+## 1. 内部 RAM、PSRAM 和 Flash 的边界
 
-## 1. Flash 存储占用（4 MB）
+PSRAM 是外部 RAM，不是文件系统。大块 PCM、网络报文、文本、画面和
+非实时任务栈使用 PSRAM；不要依赖普通 `malloc()` 自动选中它。
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 仍会让小分配优先使用内部堆。
 
-来自 `partitions.csv`：
-
-| 分区 | 偏移 | 大小 | 用途 |
-|---|---|---|---|
-| bootloader + 分区表 | 0x0000 | 36 KB | 预留 |
-| nvs | 0x9000 | 24 KB | Wi-Fi 凭据 / 校准 |
-| otadata | 0xF000 | 8 KB | OTA 选择标志 |
-| phy_init | 0x11000 | 4 KB | PHY 校准 |
-| **factory (app)** | 0x20000 | **1920 KB** | 当前运行固件 |
-| **ota_1 (app)** | 0x200000 | **1920 KB** | OTA 备份槽 |
-| storage (SPIFFS) | 0x3E0000 | 124 KB | `/wifi_config.txt`、`/app_secrets.txt` 等 |
-
-应用镜像（Wi-Fi + HTTP setup + mbedTLS + I2S + SPIFFS + LwIP，`-Os`）典型 .bin ≈ **900 – 1100 KB**，OTA 余量充裕。
-
----
-
-## 2. 应用层静态变量（DRAM .bss/.data）
-
-| 文件 | 变量 | 字节 |
+| 资源 | 存放位置 | 原因 |
 |---|---|---|
-| audio_io.c | `s_arena[64K]`（PCM 环形缓冲，REC/PLAY 共用） | 65 536 |
-| audio_io.c | `s_i2s_read_buf[512] int32` | 2 048 |
-| audio_io.c | `s_i2s_write_buf[1024] u8` | 1 024 |
-| audio_io.c | `s_decimate_buf[256] int16` | 512 |
-| voice_chat.c | `s_io_buf[2048]` + status | ~2 100 |
-| ui_screen.c | `s_framebuffer[128*64/8]` UI 画布 | 1 024 |
-| wifi_provision.c | HTTP form / 状态缓冲 | ~2 KB |
-| buttons.c | 单按钮状态 | ~24 |
-| app_main.c | 状态字符串 | ~72 |
-| font5x7.c | 字模常量 (Flash .rodata) | ~480 |
+| I2S DMA 缓冲及描述符 | 内部 DMA-capable SRAM | 当前 ESP-IDF I2S 驱动的分配要求，不直接以 PSRAM 指针替代 |
+| SPI TFT 的 640 B DMA 行缓冲 | 内部 SRAM | `st7789.c` 使用 `DMA_ATTR` |
+| `audio_io` 的 4 KB 栈 | 内部 SRAM，Core 1 | 最高优先级，只服务 I2S 和小块 PCM 搬运 |
+| 2 KB I2S 搬运区、512 B 降采样区 | 内部 SRAM | 不在高优先级路径上分配堆内存 |
+| 任务控制块、ISR/cache-off 所需数据 | 内部 SRAM | 外部任务栈不改变 TCB 的内部内存要求 |
+| 小型常驻凭据状态与配置页校验副本 | 内部 SRAM | 保留已有内部存储，临时副本显式要求 INTERNAL |
+| 音频共享 arena、网络工作区、UI 帧 | PSRAM | 容量大，允许普通任务上下文访问 |
+| 语音、报时、电台的网络/解码 worker 栈 | PSRAM，Core 0 | 与实时音频 I/O 隔离 |
+| TLS 动态分配 | PSRAM | `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` |
+| 字库、图标、只读常量 | Flash | 不为只读资源复制同等大小的 RAM 副本 |
 
-**应用静态 RAM 总计 ≈ 74 KB**（s_arena 64 KB 是绝对大头）。
+不是所有 ESP32-S3 外设 DMA 都绝对不能访问 PSRAM；支持情况取决于外设、
+驱动、对齐和缓存同步要求。本工程保留当前 I2S/SPI 的内部 DMA 路径。
+不得把 PSRAM 工作区直接传入未确认支持它的 DMA 或 cache-off/ISR 路径。
 
----
+## 2. 当前缓冲与生命周期
 
-## 3. 系统组件 RAM 预估（ESP32 ~520 KB SRAM）
+| 内容 | 容量 | 分配和释放 |
+|---|---:|---|
+| 共享音频 arena | 256 KB PSRAM | `audio_io_init()` 分配，整个设备运行期保留 |
+| REC ring 有效容量 | 64 KB | 使用共享 arena 的前 64 KB，无独立录音数组 |
+| PLAY ring 有效容量 | 256 KB | 使用同一 arena 的完整容量 |
+| I2S 搬运区 | 2 KB 内部 SRAM | `s_i2s_buffer` union，REC/PLAY 互斥复用 |
+| 录音降采样输出 | 512 B 内部 SRAM | 与录音输入同时使用，不能简单合并 |
+| Voice 上传工作区 | 2 KB PSRAM | Voice 初始化时分配，运行期保留 |
+| Voice / Chime 栈 | 各 6 KB PSRAM | 常驻 worker；空闲时任务仍存在 |
+| MP3 ring / 输入 / PCM 输出 | 32 / 2 / 8 KB PSRAM | 每次电台连接创建，reader 结束后释放 |
+| 电台 decoder / HTTP reader 栈 | 24 / 8 KB PSRAM | 随电台任务创建、退出 |
+| ASR TX / RX 工作区 | 8214 / 8193 B PSRAM | 每个 ASR session 分配一次，关闭时释放 |
+| ASR session 与识别文本 | PSRAM，动态 | session 自有；最终文本转移给调用方 |
+| Agent 响应区 | 8193 B PSRAM | 每个请求创建，提取回复后释放 |
+| Agent/TTS 请求、转义文本和回复 | PSRAM，动态 | 使用者负责释放，不进入实时音频路径 |
+| 当前帧 / 上一帧 | 各 38400 B PSRAM | UI 初始化分配，保留用于差分刷新 |
+| 配网页 / 表单 | 4096 / 1600 B PSRAM | HTTP 请求结束释放，配置服务器固定在 Core 0 |
+| Wi-Fi 扫描临时记录 | 最多 32 个，PSRAM | 扫描转换为 UI 结果后释放 |
 
-| 组件 | 静态 + 运行时 RAM |
-|---|---|
-| ROM/启动占用 | ~30 KB |
-| FreeRTOS 内核 + IDF 基础设施 | ~20 KB |
-| Wi-Fi 驱动（6 静态 RX / 16 动态 RX/TX buf） | ~50–60 KB |
-| LwIP（6 sockets, 5760 B 窗口） | ~15–20 KB |
-| SoftAP + HTTP setup server（仅配置模式） | ~15–30 KB |
-| mbedTLS（动态 buffer，8 KB content len，握手期间峰值） | ~25–45 KB（峰值） |
-| 任务栈（main 6 K + audio 4 K + voice 6 K + 系统 ~15 K） | ~32 KB |
-| 应用静态 | ~74 KB |
+明确分配的常驻 PSRAM 约 345 KB：音频 256 KB、UI 75 KB、
+Voice 上传 2 KB、Voice/Chime 栈 12 KB。
+电台运行再增加 74 KB 缓冲和栈；TLS、MP3 解码器内部堆、驱动和 TCB 另计。
+不能把这些固定容量当成完整运行时峰值。
+Wi-Fi、lwIP、HTTPD 等 SDK 任务仍由 SDK 管理其栈；本约定中的 PSRAM
+worker 栈指应用自己创建的网络/解码任务。
 
-**系统级常驻预估 ≈ 270–320 KB**。
+`esp_audio_codec` 文档给出的 MP3 44.1 kHz 双声道参考堆占用约 28 KB，
+不含栈。其内部对象的真实分配落点需要运行时跟踪，外部输入/输出已在
+PSRAM 不代表解码器内部所有分配都在 PSRAM。
 
-### 运行时空闲堆估算
-- 空闲态（STA Wi-Fi 已起，无 TLS）：**90 – 130 KB**
-- 语音聊天 + TLS 握手峰值：**40 – 80 KB**
-- 危险阈值：< 20 KB（Wi-Fi/LwIP 易丢包或断连）
+## 3. 音频所有权先于阶段
 
----
+所有音频业务必须遵循：
 
-## 4. audio_io 三块缓冲详解
-
-### 录音路径（REC：麦克风 → 网络）
-
-```
-INMP441 (32-bit, 32 kHz, 立体声)
-   ↓  I2S DMA (12 KB, 6 描述符 × 512 帧)
-s_i2s_read_buf[512] int32   ← 一次 i2s_channel_read 暂存
-   ↓  >>16 + L/R 平均 + 数字增益 + 限幅 + 2:1 抽取
-s_decimate_buf[256] int16   ← 16 kHz / 16-bit PCM 小块
-   ↓  ring_write
-s_arena[64 KB]（标记为 MIC，作 mic ring）
-   ↓  audio_io_read_mic()
-app_main / voice_worker → 豆包 ASR WebSocket
-```
-
-- `s_i2s_read_buf` 2 KB：与 `dma_frame_num=512` 对齐，一次吃完一个 DMA 描述符。
-- `s_decimate_buf` 512 B：纯 scratch；2:1 抽取后正好 256 样本。
-- `s_arena` 64 KB：作为单生产者/单消费者 ring，缓冲约 **2 秒** 16 kHz/16-bit PCM。Ring 满时丢整 chunk，`s_mic_overflow_chunks++`。
-
-### 播放路径（PLAY：网络 → 喇叭）
-
-```
-豆包 TTS HTTPS 回调（Core 0 worker）
-   ↓  audio_io_write_speaker → ring_write
-s_arena[64 KB]（标记为 SPK，作 spk ring）
-   ↓  ring_read（audio_io 任务）
-s_i2s_write_buf[1024] u8     ← 一次 i2s_channel_write 暂存
-   ↓  I2S DMA (8 KB, 8 描述符 × 512 帧)
-MAX98357A → 喇叭
+```text
+领取 owner
+  -> 网络连接 / 解码准备
+  -> REC -> 停止录音 -> 排空上传
+  -> PLAY 预填充 -> 播放 -> 停止
+  -> 关闭全部网络/解码资源，确认辅助 reader 已结束
+  -> 释放 owner
 ```
 
-- `s_i2s_write_buf` 1 KB：512 帧 × 2 B，对齐 `dma_frame_num=512`，纯透传。
-- `s_arena` 在 PLAY 阶段被复用：约 **2 秒** 播放缓冲。
-- I2S spk DMA 另留 8 KB ≈ **256 ms** 二级缓冲。
+- `voice_chat_start()`、`chime_player_start*()`、`radio_player_start()` 在
+  网络任务开始前调用 `audio_io_acquire_owner()`。
+- owner 覆盖整个业务，包括连接、Agent 等待、PCM 预填充和阶段间的 IDLE。
+  `audio_io_phase() == IDLE` 不等于没有业务在占用共享内存。
+- 同一把音频控制锁保证 owner 准入与阶段检查一致；领取要求没有 owner、
+  没有待启动请求、phase 为 IDLE，且未暂停。
+- 停止/休眠只锁存取消、请求 DMA 退出，不抢先释放 owner。
+  原 worker 关闭资源后调用 `audio_io_release_owner()`，再清除 busy。
+- release 本身不停止 I2S；如果 DMA 仍在退出，phase 继续阻止下一次领取。
+- start/prepare/read/write/reserve/commit 入口要求已有 owner。业务只能由
+  持有该 owner 的 worker 操作，不能借用别的业务的工作区。
+- 新业务增加对应 `audio_io_owner_t`，创建失败和全部清理出口都要释放。
+  App/main 的 busy 检查用于 UX，不替代底层准入。
 
-### 设计要点
-- 同一时刻只 REC 或 PLAY，`s_arena` 64 KB 复用，省一半 RAM。
-- ring role 由 `audio_io` 校验；录音 API 不能读取 speaker ring，播放
-  API 不能写入 mic ring。
-- 三个 scratch buffer 共 3.5 KB 都是 `static` → 留在 DRAM .bss，避免撑爆 audio 任务 4 KB 栈。
-- ring 本身固定分配、无碎片；网络协议和 base64 解码仍包含必要的数据搬运。
+REC/PLAY 同时只有一个 SPSC 生产者和消费者：
 
----
-
-## 5. 调优清单（按性价比排）
-
-> 关键参考：16 kHz × 16-bit 单声道 = **32 KB/s**；1 KB ≈ 31 ms 音频。
-> 判断瓶颈：`s_mic_overflow_chunks`（录侧）/ `s_spk_underrun`（放侧）。
-
-### 5.1 `TLS_RX_BUF_BYTES`（voice_chat.c） ★★★
-
-- 当前 **3072** → 建议 **8192**（与 `MBEDTLS_SSL_MAX_CONTENT_LEN` 对齐）
-- 作用：上传/下载共用，单次 TLS read 吃完整条 TLS 记录，减少解密 syscall ~10–20% CPU
-- 代价：+5 KB DRAM
-
-### 5.2 `PLAYBACK_PREFILL_BYTES`（voice_chat.c） ★★★
-
-- 当前 **32 KB（~1 s）** → 建议 **48–56 KB（1.5–1.75 s）**
-- 作用：开播前先缓冲；越大越扛网络抖动
-- 上限：≤ `s_arena - 8 KB`，所以最多 56 KB
-- 代价：开播延迟变大；不增加 RAM
-
-### 5.3 `APP_AUDIO_ARENA_BYTES`（app_config.h） ★★
-
-- 当前 **64 KB（~2 s）** → 建议 **96 KB（3 s）或 128 KB（4 s）**
-- 作用：同时改善录（更扛 Wi-Fi 阻塞）和放（可配合更大预填）
-- 代价：每加 32 KB 直接 -32 KB DRAM；建议保持 mbedTLS 握手峰值后仍 ≥ 30 KB 空闲堆
-
-### 5.4 I2S DMA 描述符（audio_io.c） ★★
-
-| 通道 | 当前 | 建议 |
-|---|---|---|
-| mic | `dma_desc_num=6, frame=512` = 12 KB ≈ 96 ms | 8 × 512 = 16 KB ≈ 128 ms |
-| **spk** | `dma_desc_num=8, frame=512` = 8 KB ≈ 256 ms | 12 × 512 = 12 KB ≈ 384 ms（或 16 × 512 = 16 KB ≈ 512 ms） |
-
-- 纯硬件级 jitter buffer，audio 任务被卡 200+ ms 也不破音
-- 代价：每加 8 KB DMA 少 8 KB 堆
-
-### 5.5 Wi-Fi 缓冲（sdkconfig.defaults） ★★
-
-```
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM   6  → 10~16
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM  16 → 32
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM  16 → 32
-```
-- 弱信号/丢包重传更顺；间接降 underrun
-- 静态 RX 每个 ~1.6 KB；6→10 约 +6.4 KB
-
-### 5.6 LwIP TCP 窗口（sdkconfig.defaults） ★★
-
-```
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT  5760  → 11520 或 16384
-CONFIG_LWIP_TCP_WND_DEFAULT      5760  → 11520 或 16384
-```
-- 当前 RTT=100 ms 单连接吞吐上限 ≈ 57 KB/s（实时音频 32 KB/s，余量小）
-- 翻倍后吞吐 ≈ 115 KB/s；代价每方向 +~6 KB
-
-### 5.7 mbedTLS 记录大小
-
-- `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=8192`，已经够大
-- 加到 16384 会多 ~8 KB 堆峰值，性价比低
-
-### 5.8 任务栈
-
-- `voice_worker` 6144、`audio_io` 4096，目前够
-- 若后续加 JSON/header 解析，把 voice_worker 提到 **8192**
-- audio_io 不要动（热点 buf 都是 static）
-
----
-
-## 6. 推荐组合方案
-
-### 方案 A — 治"录音丢字"（mic overflow 多）
-1. `TLS_RX_BUF_BYTES` 3072 → **8192**
-2. Wi-Fi 静态 RX 6 → **10**
-3. `APP_AUDIO_ARENA_BYTES` 64 K → **96 K**
-
-总增量 ≈ **+40 KB DRAM**
-
-### 方案 B — 治"播放卡顿/爆音"（spk underrun 多）
-1. spk DMA `dma_desc_num` 8 → **12**（+4 KB）
-2. `TLS_RX_BUF_BYTES` 3072 → **8192**（+5 KB）
-3. `PLAYBACK_PREFILL_BYTES` 32 K → **48 K**（不加 RAM）
-4. LwIP TCP 窗口 5760 → **11520**（+~12 KB）
-
-总增量 ≈ **+21 KB DRAM**
-
-### 方案 C — 一次到位
-A + B 并集，arena 提到 **96 KB**，总增量 ≈ **+50–55 KB**；剩余堆 40–80 KB，仍能跑但偏紧。
-**强烈建议**：加完后用 `heap_caps_print_heap_info(MALLOC_CAP_INTERNAL)` 在 PLAYING 阶段实测。
-
----
-
-## 7. 不该改的地方
-
-- `s_i2s_read_buf` / `s_decimate_buf` / `s_i2s_write_buf`：必须与 `dma_frame_num` 等大。要加请改 DMA 描述符数。
-- `MBEDTLS_SSL_MAX_CONTENT_LEN`：再加握手峰值堆会涨。
-- `voice` 任务栈过大（>12 KB）无意义，热点不在栈。
-
----
-
-## 8. 后续验证步骤
-
-构建后跑：
-
-```powershell
-idf.py size
-idf.py size-components
-idf.py size-files
+```text
+REC:  Core 1 DMA -> 内部搬运/降采样 -> PSRAM ring -> Core 0 ASR
+PLAY: Core 0 TTS/MP3 -> PSRAM ring -> Core 1 内部搬运 -> I2S DMA
 ```
 
-运行时在 `voice_chat.c` 关键节点加日志：
+仅在旧阶段停止、相关数据排空后重新初始化 ring。REC 切成 64 KB MIC；
+speaker prepare 切成 256 KB SPK 并清空旧索引。取消 epoch 继续使旧写入、
+未提交的预留和未完成的启动失效；唤醒不复活旧数据。
 
-```c
-ESP_LOGI(TAG, "free=%u min=%u internal_free=%u",
-    (unsigned)esp_get_free_heap_size(),
-    (unsigned)esp_get_minimum_free_heap_size(),
-    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-```
+## 4. 网络工作区与所有权
 
-关键采样点：boot → wifi-up → setup-ap → tls-connect → recording → uploading → playing → idle。
+ASR session 由一个 Core 0 worker 独占：
+
+- PCM chunk 上限为 8192 B；发送时把 8 B ASR 头和 PCM 直接写入、掩码到
+  可复用的 WebSocket TX 工作区，不再为每个 chunk 分配 payload/frame 副本。
+- RX 只接收至多 8192 B WebSocket payload，并预留 1 B 字符串终止空间。
+  接收指针是 session 借用区，外部不得释放或跨下一次接收保存。
+- JSON 直接在 RX 工作区内解析，检查 body 长度后终止，不再复制整段 JSON。
+- 提取的文本另有 PSRAM 存储；`doubao_asr_session_finish()` 将其转移给
+  调用方并清空 session 指针。调用方 `free()`，session close 不重复释放。
+- 接收帧上限约束文本规模；不存在独立的 2 KB 识别文本截断规则。
+- TX/RX 不合并，避免接收 Ping 后发送 Pong 时覆盖尚需读取的 payload。
+
+Agent 响应仍有 8192 B 上限。TTS 继续流式解析 base64 并推送 PCM，
+不缓存完整音频响应。请求/转义文本完成使用后及时释放。
+
+## 5. 新增 App 与修改规则
+
+1. 网络、TLS、JSON、MP3、GUI 和文件操作只在 Core 0；Core 1 不做这些工作。
+2. 大工作区及非实时网络对象显式使用
+   `heap_caps_malloc/calloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`。
+   分配失败记录/返回错误，不静默回退到内部堆。
+3. 非实时 worker 使用 `xTaskCreatePinnedToCoreWithCaps()` 选择 PSRAM 栈。
+   退出型任务必须配对 `vTaskDeleteWithCaps()`；常驻任务不反复创建/删除。
+4. 使用音频前领取 owner，全部生产者/句柄清理后释放。不要只检查 phase，
+   不从 GUI/其他任务强制关闭 worker 正在使用的网络句柄。
+5. 只能复用生命周期确实互斥的存储。MP3 ring 与 PCM ring、当前帧与上一帧、
+   Core 0 上传工作区与 Core 1 搬运区不能合并。
+6. ring 容量必须为 2 的幂，REC 容量不得超过共享 arena；当前有编译期检查。
+   不能直接改成 96 KB。预填充必须小于容量，为下一帧保留空间。
+7. 不凭感觉缩小任务栈。FreeRTOS canary 已启用，进一步缩栈先看高水位，
+   同时考虑 TLS/协议解析调用栈及局部数组。
+8. 不把 heap 总量、内部堆和 DMA 堆相加；DMA 是内部能力堆的一部分。
+   文档的容量、所有权、Core 和生命周期必须随实现一同更新。
+
+## 6. 构建与实机验证
+
+当前录音 64 KB 在 16 kHz mono 16-bit 下约 2.05 s。
+播放 256 KB 在 44.1 kHz stereo 16-bit 下约 1.49 s，在 TTS 格式下约 8.19 s。
+电台另有 32 KB 压缩 ring；64 kbps 时约容纳 4.10 s MP3。
+TTS 预填充 32 KB；电台 PCM 预填充目标约 750 ms，并限制在容量内。
+
+2026-11-15 本次构建快照（ESP-IDF 5.3.1，ESP32-S3）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| 应用 main 静态 RAM 符号总量 | 79127 B | 9503 B |
+| 全固件 `.dram0.data + .dram0.bss` | 116560 B | 46936 B |
+| 常驻 Voice/Chime 栈内部 RAM | 12 KB | 0，改用 PSRAM |
+| 电台 HTTP reader 栈内部 RAM | 8 KB | 0，改用 PSRAM |
+
+静态内部 RAM 减少 69624 B（约 68 KB），栈迁移额外减少相应运行阶段的
+内部堆占用；不是所有优化都体现在 ELF `.bss` 中。
+同次实机启动 `int=176639 B`、`dma=169111 B`、`dma_max=79872 B`；
+启动内部空闲约 172.5 KB，比优化前约 93 KB 明显增加。这不是播放峰值，
+连续电台及完整语音链路仍须按下文进行实机验收。
+这些是特定构建的结果，不是未来版本固定预算。仓库 sdkconfig 来自
+IDF 5.3.5，当前本机 IDF 5.3.1 的生成配置可能改变 Wi-Fi TX 缓冲策略；
+部署必须核对实际生成配置，不把构建器重写的无关配置提交为内存优化。
+
+链接尺寸可使用 `idf.py size` 或工具链 `size -A` / `nm -S --size-sort`；
+`dummy` 和调试段不是实际 RAM 分配，不加入堆预算。
+16 MB Flash 中 factory/OTA 槽各 4 MB，2 MB 字库仍留在 Flash。
+
+`mem_log()` 的 `heap/min` 含 PSRAM，判断内部内存风险应看 `int/dma/dma_max`。
+增加大工作区或 DMA 数量后，记录连接、首帧、录音、播放和清理完成时的数据。
+核对录音 overflow、播放 underrun、会话 owner 错误、内存是否在多轮结束后恢复。
+实机验收包括电台连续播放/切台、ASR→Agent→TTS、Chime、取消和休眠唤醒；
+少量既有主机回归不替代听音和实际网络验证。
+
+关联文档：[音频状态机](audio_state_machine.md)、
+[网络电台](network_radio_design.md)、[App GUI](modular_app_gui_design.md)。

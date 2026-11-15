@@ -9,6 +9,7 @@
 #include <freertos/event_groups.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_netif.h>
@@ -200,7 +201,8 @@ esp_err_t wifi_time_scan(wifi_scan_ap_t *results, size_t capacity,
     }
 
     uint16_t fetch = found > 32 ? 32 : found;
-    wifi_ap_record_t *records = calloc(fetch, sizeof(*records));
+    wifi_ap_record_t *records = heap_caps_calloc(
+        fetch, sizeof(*records), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!records) {
         esp_wifi_clear_ap_list();
         return ESP_ERR_NO_MEM;

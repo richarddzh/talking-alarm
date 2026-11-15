@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <esp_tls.h>
@@ -21,7 +22,10 @@ static const char *TAG = "doubao_asr";
 #define ASR_CONNECT_TIMEOUT_MS 10000
 #define ASR_READ_TIMEOUT_MS 30000
 #define ASR_FRAME_MAX_BYTES 8192
-#define ASR_TEXT_MAX_BYTES 2048
+#define ASR_PROTOCOL_HEADER_BYTES 8
+#define ASR_WS_HEADER_MAX_BYTES 14
+#define ASR_TX_BUFFER_BYTES \
+    (ASR_FRAME_MAX_BYTES + ASR_PROTOCOL_HEADER_BYTES + ASR_WS_HEADER_MAX_BYTES)
 
 #define ASR_PROTOCOL_VERSION 0x1
 #define ASR_HEADER_SIZE_WORDS 0x1
@@ -39,6 +43,8 @@ static const char *TAG = "doubao_asr";
 
 struct doubao_asr_session {
     esp_tls_t *tls;
+    uint8_t *tx_buffer;
+    uint8_t *rx_buffer;
     char *latest_text;
     bool final_sent;
 };
@@ -136,27 +142,30 @@ static int tls_read_line(esp_tls_t *tls, char *line, size_t cap, uint32_t timeou
     return -1;
 }
 
-static esp_err_t websocket_send_frame(esp_tls_t *tls, uint8_t opcode,
+static esp_err_t websocket_send_frame(doubao_asr_session_t *session,
+                                      uint8_t opcode, const uint8_t *prefix,
+                                      size_t prefix_len,
                                       const uint8_t *payload, size_t len) {
-    size_t hdr_len = 2;
-    if (len > 125 && len <= 0xffff) hdr_len += 2;
-    else if (len > 0xffff) hdr_len += 8;
-    hdr_len += 4;
-
-    uint8_t *frame = malloc(hdr_len + len);
-    if (!frame) return ESP_ERR_NO_MEM;
+    if (prefix_len > ASR_PROTOCOL_HEADER_BYTES || len > ASR_FRAME_MAX_BYTES ||
+        (prefix_len > 0 && !prefix) || (len > 0 && !payload)) {
+        ESP_LOGE(TAG, "invalid websocket payload size=%u prefix=%u",
+                 (unsigned)len, (unsigned)prefix_len);
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t payload_len = prefix_len + len;
+    uint8_t *frame = session->tx_buffer;
 
     size_t off = 0;
     frame[off++] = 0x80 | (opcode & 0x0f);
-    if (len <= 125) {
-        frame[off++] = 0x80 | (uint8_t)len;
-    } else if (len <= 0xffff) {
+    if (payload_len <= 125) {
+        frame[off++] = 0x80 | (uint8_t)payload_len;
+    } else if (payload_len <= 0xffff) {
         frame[off++] = 0x80 | 126;
-        frame[off++] = (uint8_t)(len >> 8);
-        frame[off++] = (uint8_t)len;
+        frame[off++] = (uint8_t)(payload_len >> 8);
+        frame[off++] = (uint8_t)payload_len;
     } else {
         frame[off++] = 0x80 | 127;
-        for (int i = 7; i >= 0; --i) frame[off++] = (uint8_t)(((uint64_t)len) >> (8 * i));
+        for (int i = 7; i >= 0; --i) frame[off++] = (uint8_t)(((uint64_t)payload_len) >> (8 * i));
     }
 
     uint32_t mask = esp_random();
@@ -164,17 +173,19 @@ static esp_err_t websocket_send_frame(esp_tls_t *tls, uint8_t opcode,
     memcpy(mask_bytes, &mask, sizeof(mask_bytes));
     memcpy(frame + off, mask_bytes, sizeof(mask_bytes));
     off += sizeof(mask_bytes);
-    for (size_t i = 0; i < len; ++i) {
-        frame[off + i] = payload[i] ^ mask_bytes[i & 3];
+    for (size_t i = 0; i < payload_len; ++i) {
+        uint8_t value = i < prefix_len ? prefix[i] : payload[i - prefix_len];
+        frame[off + i] = value ^ mask_bytes[i & 3];
     }
 
-    int rc = tls_write_all(tls, frame, off + len);
-    free(frame);
+    int rc = tls_write_all(session->tls, frame, off + payload_len);
     return rc == 0 ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t websocket_read_frame(esp_tls_t *tls, uint8_t **out_payload,
+static esp_err_t websocket_read_frame(doubao_asr_session_t *session,
+                                      uint8_t **out_payload,
                                       size_t *out_len, uint8_t *out_opcode) {
+    esp_tls_t *tls = session->tls;
     *out_payload = NULL;
     *out_len = 0;
     *out_opcode = 0;
@@ -207,10 +218,8 @@ static esp_err_t websocket_read_frame(esp_tls_t *tls, uint8_t **out_payload,
 
         uint8_t *payload = NULL;
         if (len > 0) {
-            payload = malloc((size_t)len + 1);
-            if (!payload) return ESP_ERR_NO_MEM;
+            payload = session->rx_buffer;
             if (tls_read_exact(tls, payload, (size_t)len, ASR_READ_TIMEOUT_MS) != 0) {
-                free(payload);
                 return ESP_FAIL;
             }
             for (size_t i = 0; masked && i < (size_t)len; ++i) payload[i] ^= mask[i & 3];
@@ -218,12 +227,12 @@ static esp_err_t websocket_read_frame(esp_tls_t *tls, uint8_t **out_payload,
         }
 
         if (opcode == 0x9) {
-            websocket_send_frame(tls, 0xA, payload, (size_t)len);
-            free(payload);
+            esp_err_t err = websocket_send_frame(session, 0xA, NULL, 0,
+                                                 payload, (size_t)len);
+            if (err != ESP_OK) return err;
             continue;
         }
         if (opcode == 0x8) {
-            free(payload);
             return ESP_FAIL;
         }
 
@@ -235,7 +244,7 @@ static esp_err_t websocket_read_frame(esp_tls_t *tls, uint8_t **out_payload,
 }
 
 static char *json_unescape_alloc(const char *src, size_t len) {
-    char *out = malloc(len + 1);
+    char *out = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out) return NULL;
     char *w = out;
     for (size_t i = 0; i < len; ++i) {
@@ -295,7 +304,7 @@ static char *extract_result_text(const char *json) {
 }
 
 static esp_err_t parse_asr_response(doubao_asr_session_t *session,
-                                    const uint8_t *payload,
+                                    uint8_t *payload,
                                     size_t len) {
     if (len < 8) return ESP_FAIL;
     uint8_t message_type = payload[1] >> 4;
@@ -338,11 +347,12 @@ static esp_err_t parse_asr_response(doubao_asr_session_t *session,
                         ((uint32_t)payload[offset + 2] << 8) |
                         payload[offset + 3];
     offset += 4;
-    if (body_len == 0 || len < offset + body_len) return ESP_OK;
-
-    char *json = malloc(body_len + 1);
-    if (!json) return ESP_ERR_NO_MEM;
-    memcpy(json, payload + offset, body_len);
+    if (body_len == 0) return ESP_OK;
+    if (body_len > len - offset) {
+        ESP_LOGE(TAG, "ASR body exceeds received frame");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    char *json = (char *)payload + offset;
     json[body_len] = 0;
 
     char *text = extract_result_text(json);
@@ -353,7 +363,6 @@ static esp_err_t parse_asr_response(doubao_asr_session_t *session,
     } else {
         free(text);
     }
-    free(json);
     return ESP_OK;
 }
 
@@ -361,15 +370,13 @@ static esp_err_t read_asr_response(doubao_asr_session_t *session) {
     uint8_t *payload = NULL;
     size_t len = 0;
     uint8_t opcode = 0;
-    esp_err_t err = websocket_read_frame(session->tls, &payload, &len, &opcode);
+    esp_err_t err = websocket_read_frame(session, &payload, &len, &opcode);
     if (err != ESP_OK) return err;
     if (opcode != 0x2) {
         ESP_LOGE(TAG, "unexpected websocket opcode=%u", opcode);
-        free(payload);
         return ESP_FAIL;
     }
     err = parse_asr_response(session, payload, len);
-    free(payload);
     return err;
 }
 
@@ -379,9 +386,7 @@ static esp_err_t send_asr_payload(doubao_asr_session_t *session,
                                   uint8_t serialization,
                                   const uint8_t *body,
                                   size_t body_len) {
-    size_t payload_len = 8 + body_len;
-    uint8_t *payload = malloc(payload_len);
-    if (!payload) return ESP_ERR_NO_MEM;
+    uint8_t payload[ASR_PROTOCOL_HEADER_BYTES];
     payload[0] = (ASR_PROTOCOL_VERSION << 4) | ASR_HEADER_SIZE_WORDS;
     payload[1] = (message_type << 4) | flags;
     payload[2] = (serialization << 4) | ASR_COMPRESSION_NONE;
@@ -390,10 +395,8 @@ static esp_err_t send_asr_payload(doubao_asr_session_t *session,
     payload[5] = (uint8_t)(body_len >> 16);
     payload[6] = (uint8_t)(body_len >> 8);
     payload[7] = (uint8_t)body_len;
-    if (body_len > 0) memcpy(payload + 8, body, body_len);
-
-    esp_err_t err = websocket_send_frame(session->tls, 0x2, payload, payload_len);
-    free(payload);
+    esp_err_t err = websocket_send_frame(session, 0x2, payload, sizeof(payload),
+                                         body, body_len);
     if (err != ESP_OK) return err;
     return read_asr_response(session);
 }
@@ -446,8 +449,18 @@ esp_err_t doubao_asr_session_start(doubao_asr_session_t **out) {
     if (!app_secrets_ready()) return ESP_ERR_INVALID_STATE;
     *out = NULL;
 
-    doubao_asr_session_t *session = calloc(1, sizeof(*session));
+    doubao_asr_session_t *session = heap_caps_calloc(
+        1, sizeof(*session), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!session) return ESP_ERR_NO_MEM;
+    session->tx_buffer = heap_caps_malloc(ASR_TX_BUFFER_BYTES,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    session->rx_buffer = heap_caps_malloc(ASR_FRAME_MAX_BYTES + 1,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!session->tx_buffer || !session->rx_buffer) {
+        ESP_LOGE(TAG, "ASR PSRAM frame buffers allocation failed");
+        doubao_asr_session_close(session);
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_tls_cfg_t cfg = {
         .skip_common_name = true,
@@ -455,7 +468,7 @@ esp_err_t doubao_asr_session_start(doubao_asr_session_t **out) {
     };
     session->tls = esp_tls_init();
     if (!session->tls) {
-        free(session);
+        doubao_asr_session_close(session);
         return ESP_FAIL;
     }
 
@@ -516,8 +529,9 @@ esp_err_t doubao_asr_session_finish(doubao_asr_session_t *session,
         if (err != ESP_OK) return err;
     }
     if (!session->latest_text || !session->latest_text[0]) return ESP_FAIL;
-    *out_text = strdup(session->latest_text);
-    return *out_text ? ESP_OK : ESP_ERR_NO_MEM;
+    *out_text = session->latest_text;
+    session->latest_text = NULL;
+    return ESP_OK;
 }
 
 void doubao_asr_session_close(doubao_asr_session_t *session) {
@@ -526,6 +540,8 @@ void doubao_asr_session_close(doubao_asr_session_t *session) {
         esp_tls_conn_destroy(session->tls);
         session->tls = NULL;
     }
+    free(session->tx_buffer);
+    free(session->rx_buffer);
     free(session->latest_text);
     free(session);
 }

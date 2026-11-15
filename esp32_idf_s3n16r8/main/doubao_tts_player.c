@@ -11,6 +11,7 @@
 #include <esp_check.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <mbedtls/base64.h>
 
@@ -85,7 +86,7 @@ static char *json_escape_alloc(const char *src) {
             break;
         }
     }
-    char *out = malloc(cap);
+    char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out) return NULL;
 
     char *w = out;
@@ -320,7 +321,8 @@ esp_err_t doubao_tts_play_text_cancellable(const char *text,
         free(escaped_text);
         return ESP_FAIL;
     }
-    char *body = malloc((size_t)body_len + 1);
+    char *body = heap_caps_malloc((size_t)body_len + 1,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
         free(escaped_text);
         return ESP_ERR_NO_MEM;

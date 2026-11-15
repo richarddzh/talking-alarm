@@ -7,6 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <driver/gpio.h>
 #include <driver/i2s_std.h>
@@ -36,9 +37,17 @@ enum {
     RING_ROLE_SPK  = 2,
 };
 
-// --- Shared arena (mic ring during REC, speaker ring during PLAY) -------
-static uint8_t  s_arena[APP_AUDIO_ARENA_BYTES] __attribute__((aligned(4)));
+_Static_assert(APP_AUDIO_ARENA_BYTES > 0 &&
+               (APP_AUDIO_ARENA_BYTES & (APP_AUDIO_ARENA_BYTES - 1)) == 0,
+               "microphone ring capacity must be a power of two");
+_Static_assert(APP_SPEAKER_BUFFER_BYTES >= APP_AUDIO_ARENA_BYTES &&
+               (APP_SPEAKER_BUFFER_BYTES & (APP_SPEAKER_BUFFER_BYTES - 1)) == 0,
+               "shared arena must cover both power-of-two ring capacities");
+
+// --- Phase-owned shared PSRAM ring ------------------------------------
+static uint8_t *s_audio_arena;
 static ring_t   s_ring;
+static audio_io_owner_t s_owner;
 
 // --- Volatile request/state flags ---------------------------------------
 static volatile uint8_t  s_phase     = AUDIO_PHASE_IDLE;
@@ -76,9 +85,11 @@ static void finish_phase(void) {
 // --- Reusable scratch buffers (kept off the task stack) -----------------
 // 与下面 install_mic / install_speaker 的 dma_frame_num 对齐：每次
 // i2s_channel_read 直接吃掉一整个 DMA 描述符，少做 syscall。
-static int32_t s_i2s_read_buf[512];     // 2 KB mic DMA staging (512 frame * 4 B)
+static union {
+    int32_t read[512];
+    uint8_t write[2048];
+} s_i2s_buffer;
 static int16_t s_decimate_buf[256];     // 512 B 32->16 kHz, 32->16 bit
-static uint8_t s_i2s_write_buf[2048];   // 2 KB speaker staging (512 stereo frames)
 
 // --- I2S handles --------------------------------------------------------
 static i2s_chan_handle_t s_mic_chan;
@@ -181,16 +192,16 @@ static esp_err_t install_speaker(void) {
     if (err != ESP_OK) { i2s_del_channel(s_spk_chan); s_spk_chan = NULL;
         audio_io_quiet_speaker_pins();
         ESP_LOGE(TAG, "spk init_std: %s", esp_err_to_name(err)); return err; }
-    memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
+    memset(s_i2s_buffer.write, 0, sizeof(s_i2s_buffer.write));
     size_t silence_loaded = 0;
     // A 512-frame DMA buffer takes 32 ms at 16 kHz. Preload before
     // enabling instead of timing out waiting 20 ms for its first interrupt.
-    err = i2s_channel_preload_data(s_spk_chan, s_i2s_write_buf,
-                                   sizeof(s_i2s_write_buf), &silence_loaded);
-    if (err != ESP_OK || silence_loaded != sizeof(s_i2s_write_buf)) {
+    err = i2s_channel_preload_data(s_spk_chan, s_i2s_buffer.write,
+                                   sizeof(s_i2s_buffer.write), &silence_loaded);
+    if (err != ESP_OK || silence_loaded != sizeof(s_i2s_buffer.write)) {
         ESP_LOGE(TAG, "spk preload: %s bytes=%u/%u",
                  esp_err_to_name(err), (unsigned)silence_loaded,
-                 (unsigned)sizeof(s_i2s_write_buf));
+                 (unsigned)sizeof(s_i2s_buffer.write));
         i2s_del_channel(s_spk_chan);
         s_spk_chan = NULL;
         audio_io_quiet_speaker_pins();
@@ -230,13 +241,13 @@ static size_t write_speaker(const uint8_t *data, size_t len) {
     return total;
 }
 
-// --- Recording phase: reuse arena as mic ring; producer = audio task ----
+// --- Recording phase: shared PSRAM mic ring; producer = audio task ------
 static void do_recording(void) {
     if (install_mic() != ESP_OK) {
         finish_phase();
         return;
     }
-    ring_reset(&s_ring);
+    ring_init(&s_ring, s_audio_arena, APP_AUDIO_ARENA_BYTES);
     s_ring_role = RING_ROLE_MIC;
     s_mic_overflow_chunks = 0;
     __sync_synchronize();
@@ -245,8 +256,8 @@ static void do_recording(void) {
 
     while (!s_req_stop && !s_req_abort && !audio_io_is_suspended()) {
         size_t bytes_read = 0;
-        esp_err_t e = i2s_channel_read(s_mic_chan, s_i2s_read_buf,
-                                       sizeof(s_i2s_read_buf),
+        esp_err_t e = i2s_channel_read(s_mic_chan, s_i2s_buffer.read,
+                                       sizeof(s_i2s_buffer.read),
                                        &bytes_read, 20);
         if (e != ESP_OK || bytes_read == 0) continue;
 
@@ -257,8 +268,8 @@ static void do_recording(void) {
         if (out_samples > 256) out_samples = 256;
 
         for (size_t i = 0; i < out_samples; ++i) {
-            int32_t a = s_i2s_read_buf[2 * i] >> 16;
-            int32_t b = s_i2s_read_buf[2 * i + 1] >> 16;
+            int32_t a = s_i2s_buffer.read[2 * i] >> 16;
+            int32_t b = s_i2s_buffer.read[2 * i + 1] >> 16;
             int32_t mixed = ((a + b) / 2) * APP_MIC_DIGITAL_GAIN;
             if (mixed >  INT16_MAX) mixed =  INT16_MAX;
             if (mixed <  INT16_MIN) mixed =  INT16_MIN;
@@ -279,7 +290,7 @@ static void do_recording(void) {
     mem_log("REC stop");
 }
 
-// --- Playback phase: reuse arena as speaker ring; consumer = audio task -
+// --- Playback phase: PSRAM PCM ring; consumer = audio task --------------
 static void do_playback(void) {
     if (install_speaker() != ESP_OK) {
         finish_phase();
@@ -295,18 +306,18 @@ static void do_playback(void) {
     size_t  total_bytes = 0;
 
     while (!s_req_abort && !audio_io_is_suspended()) {
-        size_t got = ring_read(&s_ring, s_i2s_write_buf, sizeof(s_i2s_write_buf));
+        size_t got = ring_read(&s_ring, s_i2s_buffer.write, sizeof(s_i2s_buffer.write));
         if (got > 0) {
-            size_t wrote = write_speaker(s_i2s_write_buf, got);
+            size_t wrote = write_speaker(s_i2s_buffer.write, got);
             total_bytes += wrote;
             last_data_ms = now_ms();
             continue;
         }
         if (s_req_stop) {
             // Drain any leftover that arrived between read and stop check.
-            got = ring_read(&s_ring, s_i2s_write_buf, sizeof(s_i2s_write_buf));
+            got = ring_read(&s_ring, s_i2s_buffer.write, sizeof(s_i2s_buffer.write));
             if (got > 0) {
-                size_t wrote = write_speaker(s_i2s_write_buf, got);
+                size_t wrote = write_speaker(s_i2s_buffer.write, got);
                 total_bytes += wrote;
                 continue;
             }
@@ -320,8 +331,8 @@ static void do_playback(void) {
     }
 
     if (!s_req_abort && !audio_io_is_suspended()) {
-        memset(s_i2s_write_buf, 0, sizeof(s_i2s_write_buf));
-        write_speaker(s_i2s_write_buf, sizeof(s_i2s_write_buf));
+        memset(s_i2s_buffer.write, 0, sizeof(s_i2s_buffer.write));
+        write_speaker(s_i2s_buffer.write, sizeof(s_i2s_buffer.write));
         // Normal completion drains DMA; cancellation must not wait for it.
         int64_t until = now_ms() + 350;
         while (!s_req_abort && !audio_io_is_suspended() && now_ms() < until) {
@@ -367,18 +378,58 @@ esp_err_t audio_io_init(void) {
         ESP_LOGE(TAG, "speaker pin quiet: %s", esp_err_to_name(err));
         return err;
     }
-    if (ring_init(&s_ring, s_arena, sizeof(s_arena)) != 0) {
-        ESP_LOGE(TAG, "ring init failed");
-        return ESP_FAIL;
+    s_audio_arena = heap_caps_malloc(APP_SPEAKER_BUFFER_BYTES,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_audio_arena) {
+        ESP_LOGE(TAG, "shared audio PSRAM allocation failed");
+        return ESP_ERR_NO_MEM;
     }
+    ring_init(&s_ring, s_audio_arena, APP_AUDIO_ARENA_BYTES);
     BaseType_t ok = xTaskCreatePinnedToCore(task_run, "audio_io",
                                             4096, NULL, AUDIO_TASK_PRIO, &s_task,
                                             AUDIO_TASK_CORE);
-    if (ok != pdPASS) { ESP_LOGE(TAG, "task create"); return ESP_FAIL; }
-    ESP_LOGI(TAG, "audio task started core=%d prio=%d arena=%u B",
-             AUDIO_TASK_CORE, AUDIO_TASK_PRIO, (unsigned)sizeof(s_arena));
+    if (ok != pdPASS) {
+        heap_caps_free(s_audio_arena);
+        s_audio_arena = NULL;
+        ESP_LOGE(TAG, "task create");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "audio task started core=%d prio=%d shared=%u B PSRAM mic=%u B",
+             AUDIO_TASK_CORE, AUDIO_TASK_PRIO,
+             APP_SPEAKER_BUFFER_BYTES,
+             APP_AUDIO_ARENA_BYTES);
     mem_log("audio_io_init");
     return ESP_OK;
+}
+
+esp_err_t audio_io_acquire_owner(audio_io_owner_t owner) {
+    if (owner <= AUDIO_OWNER_NONE || owner > AUDIO_OWNER_RADIO) {
+        ESP_LOGE(TAG, "invalid audio owner: %d", (int)owner);
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_control_lock);
+    bool allowed = s_task && !audio_io_is_suspended() &&
+                   __atomic_load_n(&s_owner, __ATOMIC_ACQUIRE) == AUDIO_OWNER_NONE &&
+                   s_phase == AUDIO_PHASE_IDLE && s_req_start == REQ_NONE;
+    if (allowed) __atomic_store_n(&s_owner, owner, __ATOMIC_RELEASE);
+    taskEXIT_CRITICAL(&s_control_lock);
+    return allowed ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+void audio_io_release_owner(audio_io_owner_t owner) {
+    taskENTER_CRITICAL(&s_control_lock);
+    audio_io_owner_t current = __atomic_load_n(&s_owner, __ATOMIC_ACQUIRE);
+    bool valid = owner != AUDIO_OWNER_NONE && current == owner;
+    if (valid) __atomic_store_n(&s_owner, AUDIO_OWNER_NONE, __ATOMIC_RELEASE);
+    taskEXIT_CRITICAL(&s_control_lock);
+    if (!valid) {
+        ESP_LOGE(TAG, "audio owner release mismatch: current=%d requested=%d",
+                 (int)current, (int)owner);
+    }
+}
+
+static bool has_owner(void) {
+    return __atomic_load_n(&s_owner, __ATOMIC_ACQUIRE) != AUDIO_OWNER_NONE;
 }
 
 static esp_err_t wait_phase(audio_phase_t target, uint32_t timeout_ms) {
@@ -402,7 +453,7 @@ esp_err_t audio_io_start_recording_cancellable(uint32_t ack_timeout_ms,
                                                void *ctx) {
     if (!s_task) return ESP_ERR_INVALID_STATE;
     taskENTER_CRITICAL(&s_control_lock);
-    if ((cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
+    if (!has_owner() || (cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
         s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
         taskEXIT_CRITICAL(&s_control_lock);
         return ESP_ERR_INVALID_STATE;
@@ -441,7 +492,7 @@ esp_err_t audio_io_start_playback_cancellable(uint32_t ack_timeout_ms,
                                               void *ctx) {
     if (!s_task) return ESP_ERR_INVALID_STATE;
     taskENTER_CRITICAL(&s_control_lock);
-    if ((cancelled && cancelled(ctx)) || ring_cancelled() ||
+    if (!has_owner() || (cancelled && cancelled(ctx)) || ring_cancelled() ||
         s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE ||
         s_ring_role != RING_ROLE_SPK) {
         taskEXIT_CRITICAL(&s_control_lock);
@@ -498,19 +549,20 @@ esp_err_t audio_io_prepare_speaker(uint32_t sample_rate, uint8_t channels) {
 esp_err_t audio_io_prepare_speaker_cancellable(uint32_t sample_rate, uint8_t channels,
                                                audio_io_cancel_cb_t cancelled,
                                                void *ctx) {
+    if (!s_audio_arena) return ESP_ERR_INVALID_STATE;
     if (sample_rate < 8000 || sample_rate > 96000 ||
         (channels != 1 && channels != 2)) {
         return ESP_ERR_INVALID_ARG;
     }
     taskENTER_CRITICAL(&s_control_lock);
-    if ((cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
+    if (!has_owner() || (cancelled && cancelled(ctx)) || audio_io_is_suspended() ||
         s_phase != AUDIO_PHASE_IDLE || s_req_start != REQ_NONE) {
         taskEXIT_CRITICAL(&s_control_lock);
         return ESP_ERR_INVALID_STATE;
     }
     s_spk_sample_rate = sample_rate;
     s_spk_channels = channels;
-    ring_reset(&s_ring);
+    ring_init(&s_ring, s_audio_arena, APP_SPEAKER_BUFFER_BYTES);
     s_ring_role = RING_ROLE_SPK;
     __atomic_store_n(&s_ring_epoch, __atomic_load_n(&s_epoch, __ATOMIC_RELAXED),
                      __ATOMIC_RELEASE);
@@ -519,7 +571,7 @@ esp_err_t audio_io_prepare_speaker_cancellable(uint32_t sample_rate, uint8_t cha
 }
 
 size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms) {
-    if (ring_cancelled() || s_ring_role != RING_ROLE_MIC) return 0;
+    if (!has_owner() || ring_cancelled() || s_ring_role != RING_ROLE_MIC) return 0;
     if (timeout_ms == 0) return ring_read(&s_ring, dst, maxlen);
     int64_t t0 = now_ms();
     for (;;) {
@@ -532,7 +584,7 @@ size_t audio_io_read_mic(uint8_t *dst, size_t maxlen, uint32_t timeout_ms) {
 }
 
 size_t audio_io_write_speaker(const uint8_t *src, size_t len, uint32_t timeout_ms) {
-    if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
+    if (!has_owner() || ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
         (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
         return 0;
     }
@@ -550,7 +602,7 @@ size_t audio_io_write_speaker(const uint8_t *src, size_t len, uint32_t timeout_m
 
 size_t audio_io_reserve_speaker(uint8_t **dst, uint32_t timeout_ms) {
     if (!dst) return 0;
-    if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
+    if (!has_owner() || ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
         (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
         return 0;
     }
@@ -559,7 +611,7 @@ size_t audio_io_reserve_speaker(uint8_t **dst, uint32_t timeout_ms) {
         if (ring_cancelled()) return 0;
         size_t n = ring_write_acquire(&s_ring, dst);
         if (n) return n;
-        if (ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
+        if (!has_owner() || ring_cancelled() || s_ring_role != RING_ROLE_SPK ||
             (s_phase != AUDIO_PHASE_IDLE && s_phase != AUDIO_PHASE_PLAY)) {
             return 0;
         }

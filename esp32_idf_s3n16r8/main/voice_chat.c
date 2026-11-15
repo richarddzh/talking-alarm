@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 
 static const char *TAG = "voice";
@@ -29,7 +31,7 @@ static bool s_finish_requested;
 static doubao_asr_session_t *s_asr;
 static size_t s_uploaded_bytes;
 
-static uint8_t s_io_buf[VOICE_IO_BUF_BYTES];
+static uint8_t *s_io_buf;
 
 static voice_chat_status_cb_t s_status_cb;
 static void *s_status_ctx;
@@ -78,10 +80,22 @@ esp_err_t voice_chat_init(void) {
     esp_err_t e = audio_io_init();
     if (e != ESP_OK) return e;
     if (!s_worker_task) {
-        BaseType_t ok = xTaskCreatePinnedToCore(voice_worker, "voice_worker",
+        s_io_buf = heap_caps_malloc(VOICE_IO_BUF_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_io_buf) {
+            ESP_LOGE(TAG, "voice PSRAM buffer allocation failed");
+            return ESP_ERR_NO_MEM;
+        }
+        BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(voice_worker, "voice_worker",
                                                 6144, NULL, VOICE_TASK_PRIO,
-                                                &s_worker_task, VOICE_TASK_CORE);
-        if (ok != pdPASS) return ESP_FAIL;
+                                                &s_worker_task, VOICE_TASK_CORE,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ok != pdPASS) {
+            heap_caps_free(s_io_buf);
+            s_io_buf = NULL;
+            ESP_LOGE(TAG, "voice PSRAM task creation failed");
+            return ESP_ERR_NO_MEM;
+        }
     }
     set_status(VC_IDLE, "voice ready");
     return ESP_OK;
@@ -104,8 +118,8 @@ static void close_asr(void) {
 esp_err_t voice_chat_start(void) {
     if (!s_worker_task) return ESP_ERR_INVALID_STATE;
     taskENTER_CRITICAL(&s_lock);
-    if (voice_chat_busy() || audio_io_is_suspended() ||
-        audio_io_phase() != AUDIO_PHASE_IDLE) {
+    if (voice_chat_busy() ||
+        audio_io_acquire_owner(AUDIO_OWNER_VOICE) != ESP_OK) {
         taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -124,7 +138,7 @@ esp_err_t voice_chat_pump(void) {
 
 static esp_err_t pump_mic(void) {
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
-    size_t n = audio_io_read_mic(s_io_buf, sizeof(s_io_buf), 5);
+    size_t n = audio_io_read_mic(s_io_buf, VOICE_IO_BUF_BYTES, 5);
     if (n == 0) return ESP_OK;
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
     esp_err_t err = doubao_asr_session_send_audio(s_asr, s_io_buf, n, false);
@@ -139,7 +153,7 @@ static esp_err_t drain_mic_to_asr_final(void) {
 
     for (;;) {
         if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
-        size_t n = audio_io_read_mic(s_io_buf, sizeof(s_io_buf), 0);
+        size_t n = audio_io_read_mic(s_io_buf, VOICE_IO_BUF_BYTES, 0);
         if (n == 0) break;
 
         if (last_len > 0) {
@@ -241,6 +255,7 @@ done:
             set_status(VC_DONE, "voice done");
         }
         mem_log("voice done");
+        audio_io_release_owner(AUDIO_OWNER_VOICE);
         __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
     }
 }

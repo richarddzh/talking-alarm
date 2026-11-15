@@ -327,6 +327,51 @@ class InputTests(unittest.TestCase):
         self.poll()
         return self.poll(61)
 
+    def move_axis(self, pin, raw):
+        self.lib.host_set_axis(pin, raw)
+        self.poll()
+        return self.poll(40)
+
+    def test_axis_spikes_do_not_move_focus(self):
+        self.lib.buttons_init()
+        for raw in (4095, 2048, 0, 2048) * 10:
+            self.lib.host_set_axis(20, raw)
+            self.assertFalse(self.poll(10)[0])
+        self.assertFalse(self.lib.buttons_active())
+
+    def test_held_axis_has_slow_repeat_without_catchup(self):
+        self.lib.buttons_init()
+        self.assertEqual(self.move_axis(20, 4095), (True, 4))
+        self.assertFalse(self.poll(499)[0])
+        self.assertEqual(self.poll(1), (True, 4))
+        self.assertFalse(self.poll(249)[0])
+        self.assertEqual(self.poll(1), (True, 4))
+        self.assertEqual(self.poll(5000), (True, 4))
+        self.assertFalse(self.poll()[0])
+
+    def test_brief_neutral_dip_does_not_retrigger_direction(self):
+        self.lib.buttons_init()
+        self.assertEqual(self.move_axis(20, 4095), (True, 4))
+        self.lib.host_set_axis(20, 2048)
+        self.assertFalse(self.poll(10)[0])
+        self.lib.host_set_axis(20, 4095)
+        self.assertFalse(self.poll(10)[0])
+        self.assertFalse(self.poll(40)[0])
+        self.assertTrue(self.lib.buttons_active())
+
+    def test_direction_can_reverse_without_neutral_sample(self):
+        self.lib.buttons_init()
+        self.assertEqual(self.move_axis(20, 4095), (True, 4))
+        self.assertEqual(self.move_axis(20, 0), (True, 3))
+        self.assertFalse(self.poll(250)[0])
+
+    def test_both_axes_keep_installation_direction(self):
+        self.lib.buttons_init()
+        self.assertEqual(self.move_axis(19, 0), (True, 6))
+        self.move_axis(19, 2048)
+        self.assertFalse(self.lib.buttons_active())
+        self.assertEqual(self.move_axis(19, 4095), (True, 5))
+
     def test_boot_low_cannot_prevent_screen_off_or_wake_it(self):
         for pin in (4, 21):
             with self.subTest(pin=pin):
@@ -366,11 +411,9 @@ class InputTests(unittest.TestCase):
     def test_suppressed_b_press_does_not_latch_activity(self):
         self.lib.buttons_init()
         self.poll(200)
-        self.lib.host_set_axis(20, 4095)
-        self.assertEqual(self.poll(), (True, 4))
+        self.assertEqual(self.move_axis(20, 4095), (True, 4))
         self.assertEqual(self.set_button(21, 0)[0], False)
-        self.lib.host_set_axis(20, 2048)
-        self.assertFalse(self.poll()[0])
+        self.assertFalse(self.move_axis(20, 2048)[0])
         # B remains electrically low, but no B action was accepted.
         self.assertFalse(self.lib.buttons_active())
         self.assertFalse(self.poll(60_000)[0])

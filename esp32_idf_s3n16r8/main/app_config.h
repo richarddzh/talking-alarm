@@ -58,11 +58,10 @@
 #define APP_MIC_DIGITAL_GAIN      2
 #define APP_VOICE_MAX_RECORD_MS   10000U
 
-// Single shared audio arena reused as mic ring (RECORD phase) or
-// speaker ring (PLAY phase). 必须是 2 的幂（SPSC ring 用掩码代替取模）。
-// 64 KB ≈ 2 s mic 缓冲（16 kHz mono 16-bit）；WiFi 抖动时麦克风端可以
-// 多撑约 1.5 s；播放预热 16 KB 后再启动 I2S，给 TLS 读数留头。
+// One PSRAM allocation backs both phases; recording uses its first 64 KB.
+// Both capacities must be powers of two.
 #define APP_AUDIO_ARENA_BYTES     (64 * 1024)
+#define APP_SPEAKER_BUFFER_BYTES  (256 * 1024)
 
 // ---- Network -----------------------------------------------------------
 #define APP_WIFI_CONNECT_TIMEOUT_MS  20000U

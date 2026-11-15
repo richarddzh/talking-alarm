@@ -10,7 +10,7 @@ Arduino 版在录音/播放时丢帧明显，主要原因是 Arduino-ESP32 在 `
 
 - 单独的 audio task 钉在 **Core 1**，与 Wi-Fi/lwIP/main 完全分核
 - 新版 `driver/i2s_std.h` 接口，DMA buffer 数量/大小可单独调
-- `esp_tls` 原生连接 + 手写 chunked 协议，录音 ring → 网络是零拷贝
+- `esp_tls` 原生连接，录音经 PSRAM ring 分块上传，复用 WebSocket 工作区
 - 原生 320×240、16 色索引 GUI；38.4 KB framebuffer 放在 PSRAM
 - 完整 GNU Unifont BMP 中文点阵字体 + UTF-8 渲染
 - 模块化 App Shell、手机式图标主导航和固定底部状态栏
@@ -22,7 +22,7 @@ Arduino 版在录音/播放时丢帧明显，主要原因是 Arduino-ESP32 在 `
 | 任务                    | 默认/配置                              | 实际所在 Core |
 |-------------------------|----------------------------------------|----------------|
 | `app_main` / 主循环     | `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y` | **Core 0**    |
-| `voice_worker` / `chime_worker` / `radio_player` | `xTaskCreatePinnedToCore(..., 0)` | **Core 0** |
+| `voice_worker` / `chime_worker` / `radio_player` / `radio_http` | `xTaskCreatePinnedToCoreWithCaps(..., 0, MALLOC_CAP_SPIRAM)` | **Core 0** |
 | Wi-Fi 任务              | `CONFIG_ESP_WIFI_TASK_CORE_ID=0`       | **Core 0**    |
 | lwIP TCP/IP 任务        | `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` | **Core 0**  |
 | `audio_io` （I2S 收发） | `xTaskCreatePinnedToCore(..., 1)` + `configMAX_PRIORITIES - 1` | **Core 1** |
@@ -42,16 +42,19 @@ SPSC ring**（`main/ring.[ch]`），同步只靠：
 - `__sync_synchronize()` 全屏障 —— 保证生产者写完数据再让 head 推进，
   消费者看到新 head 后再去读数据
 
-| 阶段       | 生产者              | 消费者              | 共享 64 KB arena 当作 |
+| 阶段       | 生产者              | 消费者              | 缓冲 |
 |-----------|---------------------|---------------------|------------------------------|
-| RECORD    | audio task (Core 1) | voice pipeline (Core 0) | mic ring                 |
-| PLAY      | TTS 或 MP3 worker (Core 0) | audio task (Core 1) | spk ring                |
+| RECORD    | audio task (Core 1) | voice pipeline (Core 0) | 共享 PSRAM arena 的前 64 KB |
+| PLAY      | TTS 或 MP3 worker (Core 0) | audio task (Core 1) | 256 KB PSRAM PCM ring |
 
 由于 RECORD 和 PLAY **永远不会同时发生**（长按单按钮录音 → 松开 → 上传 →
-等回包 → 播放，是一个完整的串行序列），所以同一块 64 KB 内存先被录音
-端用，后被播放端用。录音开始前将 ring 标记为 `MIC` 并重置；TTS 播放
-预填充前将其标记为 `SPK` 并重置。读写 API 会校验 role，防止状态错误时
-交叉破坏共享 arena。
+等回包 → 播放，是一个完整的串行序列），所以同一个 ring 控制结构按阶段
+切换同一块 256 KB PSRAM 的有效容量：REC 使用前 64 KB，PLAY 使用全部
+256 KB。读写 API 校验 owner、role 和取消 epoch，防止不同业务交叉写入。
+I2S DMA 和 REC/PLAY 复用的 2 KB 搬运区始终留在内部 DRAM。电台另外使用 32 KB PSRAM
+压缩数据 ring，将网络读取和 MP3 解码等待分离。
+业务在网络连接前领取 owner，全部生产者和句柄清理后释放；不能只看 phase
+为 IDLE 就认为音频工作区可用。
 
 主循环、worker 和 Core 1 音频阶段的完整状态、超时取消及错误恢复规则见
 [docs/audio_state_machine.md](docs/audio_state_machine.md)。
@@ -92,57 +95,25 @@ python tools\test_idle_power.py --clang C:\Espressif\tools\esp-clang\16.0.1-fe4f
 以及断电重启后设置恢复。背光实际省电效果需要接线后测量。
 
 
-## 内存预算评估
+## 内存预算与扩展约定
 
-ESP32-S3 N16R8 带 512 KB SRAM、16 MB Flash 和 8 MB Octal PSRAM。
-I2S DMA、Wi-Fi DMA 和关键任务栈仍需使用内部 SRAM；普通动态分配可按
-ESP-IDF capability 规则使用 PSRAM。
-当 **Wi-Fi + TLS + 录音** 三者同时活跃时（最紧张），DRAM 大致分布：
+当前内存布局、缓冲生命周期、DMA/PSRAM 边界和新 App 接入规则统一维护在
+[docs/memory_analysis.md](docs/memory_analysis.md)。
+大工作区、ASR/Agent/TTS 网络对象及 Core 0 worker 栈显式放在 PSRAM；
+内部 SRAM 留给 I2S/SPI DMA、实时搬运、`audio_io` 栈和系统必需对象。
+普通 `malloc()` 不保证分配到 PSRAM，分配失败不得静默回退挤占内部堆。
 
-| 占用方                                 | 约略大小       |
-|---------------------------------------|----------------|
-| Wi-Fi static + 动态 RX/TX 缓冲         | 50 KB          |
-| lwIP TCP 窗口（已调小）                | 15 KB          |
-| mbedTLS 一次握手 + 应用流              | 20–30 KB *     |
-| FreeRTOS 内核 + ROM 保留               | ~30 KB         |
-| 本应用音频 arena                       | **64 KB**      |
-| 本应用 I2S DMA（mic 12 KB；spk mono 8 KB / stereo 16 KB） | **20–28 KB** |
-| 本应用各任务栈 (audio 4K + main 6K)    | 10 KB          |
-| UI framebuffer + 其它静态缓冲          | ~5 KB          |
-| **小计已分配**                         | **214–224 KB** |
-| **预计空闲堆**                         | **95–105 KB**  |
+本次构建应用静态 RAM 从 79127 B 降至 9503 B，释放约 68 KB 内部 RAM；
+worker 栈迁移额外降低运行时内部堆占用。精确预算需核对当前 ELF 和实际
+生成配置，不能把这组数值作为未来版本的固定额度。
 
-`*` mbedTLS 一档：本版关掉了根证书 bundle、关掉了时间相关 X.509 校验，
-并通过 `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y` 让 esp_tls 把 mbedTLS
-authmode 设成 `MBEDTLS_SSL_VERIFY_NONE`，**完全不解析证书链、不查
-签名、不查吊销**，所以握手期堆占用比常规校验少 ~10–15 KB。详见
-[「TLS 安全选项」](#tls-安全选项---默认完全不校验) 一节。
+`APP_AUDIO_ARENA_BYTES` 控制 REC 有效容量，`APP_SPEAKER_BUFFER_BYTES`
+控制共享 PSRAM 分配及 PLAY 容量。两者必须为 2 的幂，REC 不得超过 PLAY；
+新增预填充目标必须为下一帧留出空间。I2S DMA 数量不能随 PSRAM 容量盲目放大。
+TLS 外部内存不改变已有证书校验策略；需要保护外部 RAM 中敏感数据时，
+应按 ESP-IDF 安全指南配置 Flash/PSRAM 加密。
 
-切到 SoftAP 配网模式时会停止 STA 连接，主循环暂停语音、chime 和自动联网任务，只保留单按钮长按检测与 HTTP 配网页服务。
-
-### 还能放大吗？
-
-- **可以再放大 mic/spk arena**：受限于 power-of-two，下一档是
-  **128 KB**（≈ 4 s mic 缓冲）。空闲堆会从 ~100 KB 掉到 ~35 KB，
-  TLS 握手在某些证书链上瞬时分配可能会蹭到这条线，存在握手失败的
-  风险。板载 8 MB PSRAM 已启用；若后续把 arena 改为动态 capability
-  分配，可将大缓冲移入 PSRAM，但 I2S DMA 缓冲必须保留在内部 SRAM。
-- **I2S DMA 描述符已经放大**到 mic 6×512 frame（12 KB DMA / 96 ms 采集
-  窗口）和 spk 8×512 frame（16 kHz mono 时 8 KB；44.1 kHz stereo 时
-  16 KB / 约 93 ms 播放窗口）。这意味着即使
-  audio task 因为 SPI flash 操作或缓存抖动被挤掉 50–100 ms，DMA 也不会
-  溢出/欠运行。继续放大需要消耗 `MALLOC_CAP_DMA` 池（ESP32 总共约
-  110 KB，要给 Wi-Fi DMA 留 30–40 KB），所以默认到此为止；如果实测
-  仍有偶发 underrun，下一步是把 spk 改成 12×512 frame（12 KB DMA /
-  384 ms 窗口）。
-- **本版默认值的实测意义**：
-  - mic 端：可吸收最长 ~2 s 的网络回退/卡顿不丢帧；
-  - spk 端：开播前先攒 0.5 s，TLS 偶发的 200–300 ms 长 read 不会
-    立即引起 underrun。
-
-如果你确认设备运行环境里堆有富余，把 `APP_AUDIO_ARENA_BYTES` 改成
-`(128 * 1024)` 即可；别忘了在 `voice_chat.c` 把 `PLAYBACK_PREFILL_BYTES`
-也按比例放大（保持 ≤ arena 的 1/4 比较安全）。
+切到 SoftAP 配网模式时暂停音频业务，HTTP 配网页工作区与音频业务不并行。
 
 ### 如何用日志验证当前预算合不合理
 
@@ -155,7 +126,7 @@ I (12345) mem: <tag> heap=NNN min=NNN int=NNN dma=NNN dma_max=NNN
 
 | 字段 | 含义 |
 |---|---|
-| `heap`    | 当前空闲堆（DRAM 可分配总量）|
+| `heap`    | 当前空闲堆（含 PSRAM）|
 | `min`     | **启动到现在的历史最低空闲堆** —— 决定能不能再放大 buffer 的关键指标 |
 | `int`     | `MALLOC_CAP_INTERNAL` 当前空闲（排除 PSRAM）|
 | `dma`     | `MALLOC_CAP_DMA` 当前空闲（Wi-Fi 与 I2S DMA 共享池）|
@@ -166,7 +137,8 @@ I (12345) mem: <tag> heap=NNN min=NNN int=NNN dma=NNN dma_max=NNN
 | tag                | 触发场景                          |
 |--------------------|-----------------------------------|
 | `boot done`        | 启动流程结束                      |
-| `audio_io_init`    | audio task 创建完，arena 已占用    |
+| `audio_io_init`    | audio task 创建完，共享 PSRAM arena 已分配 |
+| `radio PCM ready`  | MP3 首帧解码，准备开始 PCM 预缓冲 |
 | `mic install`      | I2S0 mic DMA 分配后                |
 | `spk install`      | I2S1 spk DMA 分配后                |
 | `REC stop`         | 一次录音收尾、mic DMA 释放         |
@@ -180,9 +152,10 @@ I (12345) mem: <tag> heap=NNN min=NNN int=NNN dma=NNN dma_max=NNN
 
 调参三条经验法则：
 
-1. 长跑 `periodic` 的 `min` 持续下滑 → 有泄漏，不要再放大 buffer。
+1. 多轮操作结束后 `heap/int` 不能恢复，且 `min` 持续下降 → 排查泄漏；
+   单独历史最低值下降不能证明泄漏。
 2. `voice tls post` 的 `min` 比 `voice tls pre` 掉 30 KB 以上 → TLS 握手
-   是当前内存峰值，再放大 arena 风险偏高。
+   是当前内存峰值，应同时检查内部能力堆与 PSRAM 分配落点。
 3. `mic install` / `spk install` 后 `dma_max` 显著低于 `dma` 总量
    → DMA 池开始碎片化，不要再加 dma_desc_num。
 
@@ -384,7 +357,7 @@ esp32_wifi_alarm_idf/
     ├── app_main.c          状态机 + UI 编排
     ├── app_config.h        引脚 / URL / SoftAP / 缓冲区大小
     ├── ring.[ch]           SPSC 字节 ring（无锁）
-    ├── audio_io.[ch]       Core 1 上的 I2S 任务，复用 64 KB arena
+    ├── audio_io.[ch]       Core 1 I2S，共享 PSRAM 与业务 owner
     ├── voice_chat.[ch]     esp-tls chunked POST + body 直推 ring 播放
     ├── wifi_creds.[ch]     当前 Wi-Fi 与历史网络 SPIFFS 读写
     ├── app_secret_store.[ch] SPIFFS /app_secrets.txt 读写

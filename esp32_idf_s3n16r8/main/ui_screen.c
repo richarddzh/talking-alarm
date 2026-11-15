@@ -342,6 +342,7 @@ esp_err_t ui_draw_rgb565_bitmap(int x, int y, int width, int height,
 }
 
 esp_err_t ui_init(void) {
+    if (s_framebuffer && s_previous_framebuffer) return ESP_OK;
     s_framebuffer = heap_caps_calloc(
         1, FRAMEBUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_framebuffer) {
@@ -359,9 +360,19 @@ esp_err_t ui_init(void) {
     }
     s_previous_valid = false;
     esp_err_t err = st7789_init();
-    if (err != ESP_OK) return err;
-    ui_begin(UI_COLOR_BLACK);
-    return ui_flush();
+    if (err == ESP_OK) {
+        ui_begin(UI_COLOR_BLACK);
+        err = ui_flush();
+    }
+    if (err != ESP_OK) {
+        heap_caps_free(s_framebuffer);
+        heap_caps_free(s_previous_framebuffer);
+        s_framebuffer = NULL;
+        s_previous_framebuffer = NULL;
+        s_previous_valid = false;
+        ESP_LOGE(TAG, "UI initialization failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 void ui_show_face(const char *title,

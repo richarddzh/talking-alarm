@@ -11,8 +11,9 @@
 #define AXIS_CALIBRATION_SAMPLES 32
 #define AXIS_PRESS_DELTA 850
 #define AXIS_RELEASE_DELTA 500
-#define AXIS_FIRST_REPEAT_MS 350
-#define AXIS_REPEAT_MS 140
+#define AXIS_DEBOUNCE_MS 40
+#define AXIS_FIRST_REPEAT_MS 500
+#define AXIS_REPEAT_MS 250
 #define JOYSTICK_BUTTON_DEBOUNCE_MS 60
 #define JOYSTICK_NEUTRAL_GUARD_MS 100
 
@@ -30,6 +31,8 @@ typedef struct {
     int center;
     int last_raw;
     int active_direction;
+    int pending_direction;
+    int64_t pending_since_ms;
     int64_t next_repeat_ms;
 } analog_axis_t;
 
@@ -81,6 +84,8 @@ static void init_axis(analog_axis_t *axis, int pin) {
     axis->center = total / AXIS_CALIBRATION_SAMPLES;
     axis->last_raw = axis->center;
     axis->active_direction = 0;
+    axis->pending_direction = 0;
+    axis->pending_since_ms = 0;
     axis->next_repeat_ms = 0;
 }
 
@@ -152,24 +157,28 @@ static bool poll_axis(analog_axis_t *axis, bool inverted,
     if (inverted) delta = -delta;
     int64_t now = esp_timer_get_time() / 1000;
 
-    if (axis->active_direction != 0) {
-        if (delta > -AXIS_RELEASE_DELTA && delta < AXIS_RELEASE_DELTA) {
-            axis->active_direction = 0;
-            return false;
-        }
-        if (now < axis->next_repeat_ms) return false;
-        axis->next_repeat_ms = now + AXIS_REPEAT_MS;
-        *event = axis->active_direction < 0 ? negative_event : positive_event;
-        return true;
+    int direction = 0;
+    if (delta <= -AXIS_PRESS_DELTA) direction = -1;
+    else if (delta >= AXIS_PRESS_DELTA) direction = 1;
+    else if ((axis->active_direction < 0 && delta <= -AXIS_RELEASE_DELTA) ||
+             (axis->active_direction > 0 && delta >= AXIS_RELEASE_DELTA)) {
+        direction = axis->active_direction;
     }
-
-    if (delta <= -AXIS_PRESS_DELTA || delta >= AXIS_PRESS_DELTA) {
-        axis->active_direction = delta < 0 ? -1 : 1;
+    if (direction != axis->pending_direction) {
+        axis->pending_direction = direction;
+        axis->pending_since_ms = now;
+    }
+    if (direction != axis->active_direction) {
+        if (now - axis->pending_since_ms < AXIS_DEBOUNCE_MS) return false;
+        axis->active_direction = direction;
         axis->next_repeat_ms = now + AXIS_FIRST_REPEAT_MS;
-        *event = delta < 0 ? negative_event : positive_event;
-        return true;
+        if (direction == 0) return false;
+    } else {
+        if (direction == 0 || now < axis->next_repeat_ms) return false;
+        axis->next_repeat_ms = now + AXIS_REPEAT_MS;
     }
-    return false;
+    *event = direction < 0 ? negative_event : positive_event;
+    return true;
 }
 
 static bool axis_is_neutral(const analog_axis_t *axis) {

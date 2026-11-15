@@ -9,6 +9,7 @@
 #include <esp_check.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
 
@@ -82,7 +83,8 @@ static bool form_value(const char *body, const char *key, char *out, size_t cap)
 }
 
 static esp_err_t send_page(httpd_req_t *req, const char *message) {
-    app_secrets_t *secrets = calloc(1, sizeof(*secrets));
+    app_secrets_t *secrets = heap_caps_calloc(
+        1, sizeof(*secrets), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!secrets) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
         return ESP_OK;
@@ -92,7 +94,8 @@ static esp_err_t send_page(httpd_req_t *req, const char *message) {
     const bool have_agent = secrets->agent_api_key[0] != 0;
     const bool have_tts = secrets->tts_api_key[0] != 0;
 
-    char *page = calloc(1, SETUP_PAGE_MAX);
+    char *page = heap_caps_calloc(1, SETUP_PAGE_MAX,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!page) {
         free(secrets);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
@@ -150,7 +153,8 @@ static esp_err_t root_post(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    char *body = calloc(1, FORM_BODY_MAX);
+    char *body = heap_caps_calloc(1, FORM_BODY_MAX,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
         return ESP_OK;
@@ -222,6 +226,7 @@ static esp_err_t root_post(httpd_req_t *req) {
 
 static esp_err_t start_httpd(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.core_id = 0;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192;
     cfg.max_open_sockets = 2;

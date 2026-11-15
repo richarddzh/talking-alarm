@@ -1,18 +1,24 @@
 #include "radio_player.h"
 
 #include "audio_io.h"
+#include "app_config.h"
+#include "mem_log.h"
 #include "radio_stations.h"
+#include "ring.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 #include <esp_audio_dec_default.h>
 #include <esp_audio_simple_dec.h>
 #include <esp_audio_simple_dec_default.h>
 #include <esp_http_client.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 
@@ -21,8 +27,14 @@
 #define RADIO_TASK_CORE 0
 #define RADIO_INPUT_BYTES 2048
 #define RADIO_OUTPUT_BYTES 8192
-#define RADIO_PREFILL_BYTES (16 * 1024)
+#define RADIO_PREFILL_MS 750
+#define RADIO_NETWORK_BYTES (32 * 1024)
+#define RADIO_NETWORK_PREFILL_BYTES (12 * 1024)
+#define RADIO_READER_STACK_BYTES (8 * 1024)
 #define RADIO_HTTP_TIMEOUT_MS 1500
+#define RADIO_STALL_TIMEOUT_MS 8000
+#define RADIO_MAX_REDIRECTS 4
+#define RADIO_MAX_RETRIES 3
 #define RADIO_WRITE_TIMEOUT_MS 2000
 #define RADIO_SPECTRUM_INTERVAL_MS 80
 #define RADIO_SPECTRUM_SAMPLES 128
@@ -42,6 +54,18 @@ static radio_player_snapshot_t s_snapshot = {
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_spectrum_ms;
 static float s_spectrum_peak;
+
+typedef struct {
+    esp_http_client_handle_t client;
+    ring_t ring;
+    bool reader_stop;
+    bool reader_done;
+    esp_err_t reader_result;
+    esp_err_t header_result;
+    size_t metadata_interval;
+    size_t audio_remaining;
+    size_t metadata_remaining;
+} radio_stream_t;
 
 static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
@@ -82,12 +106,13 @@ static void set_format(const esp_audio_simple_dec_info_t *info) {
 }
 
 static void finish_task(void) {
+    audio_io_release_owner(AUDIO_OWNER_RADIO);
     taskENTER_CRITICAL(&s_lock);
     s_task = NULL;
     ++s_snapshot.generation;
     __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
     taskEXIT_CRITICAL(&s_lock);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void process_pcm(int16_t *samples, size_t size, uint8_t channels) {
@@ -159,7 +184,8 @@ static void process_pcm(int16_t *samples, size_t size, uint8_t channels) {
 }
 
 static esp_err_t push_pcm(uint8_t *data, size_t size, uint8_t channels,
-                          bool *playback_started, size_t *prefill_bytes) {
+                          bool *playback_started, size_t *prefill_bytes,
+                          size_t prefill_target) {
     process_pcm((int16_t *)data, size, channels);
     size_t offset = 0;
     while (offset < size && !stop_requested()) {
@@ -170,7 +196,7 @@ static esp_err_t push_pcm(uint8_t *data, size_t size, uint8_t channels,
         offset += written;
         if (!*playback_started) {
             *prefill_bytes += written;
-            if (*prefill_bytes >= RADIO_PREFILL_BYTES) {
+            if (*prefill_bytes >= prefill_target) {
                 esp_err_t err = audio_io_start_playback_cancellable(2000, playback_cancelled, NULL);
                 if (err != ESP_OK) return err;
                 *playback_started = true;
@@ -181,14 +207,98 @@ static esp_err_t push_pcm(uint8_t *data, size_t size, uint8_t channels,
     return stop_requested() ? ESP_ERR_INVALID_STATE : ESP_OK;
 }
 
-static esp_err_t decode_stream(esp_http_client_handle_t client) {
-    uint8_t *input = malloc(RADIO_INPUT_BYTES);
-    uint8_t *output = malloc(RADIO_OUTPUT_BYTES);
-    if (!input || !output) {
+static esp_err_t http_event(esp_http_client_event_t *event) {
+    radio_stream_t *stream = event->user_data;
+    if (event->event_id == HTTP_EVENT_ON_HEADER &&
+        strcasecmp(event->header_key, "icy-metaint") == 0) {
+        char *end = NULL;
+        unsigned long interval = strtoul(event->header_value, &end, 10);
+        if (end == event->header_value || *end != '\0' ||
+            interval == 0 || interval > 1024 * 1024) {
+            stream->header_result = ESP_ERR_INVALID_RESPONSE;
+            ESP_LOGE(TAG, "invalid icy-metaint header");
+        } else {
+            stream->metadata_interval = interval;
+            stream->audio_remaining = interval;
+        }
+    }
+    return ESP_OK;
+}
+
+static size_t strip_metadata(radio_stream_t *stream, uint8_t *data, size_t size) {
+    if (stream->metadata_interval == 0) return size;
+    size_t audio_size = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (stream->metadata_remaining > 0) {
+            if (--stream->metadata_remaining == 0) {
+                stream->audio_remaining = stream->metadata_interval;
+            }
+        } else if (stream->audio_remaining == 0) {
+            stream->metadata_remaining = (size_t)data[i] * 16;
+            if (stream->metadata_remaining == 0) {
+                stream->audio_remaining = stream->metadata_interval;
+            }
+        } else {
+            data[audio_size++] = data[i];
+            --stream->audio_remaining;
+        }
+    }
+    return audio_size;
+}
+
+static void stream_reader(void *arg) {
+    radio_stream_t *stream = arg;
+    esp_err_t result = ESP_OK;
+    int64_t last_data_ms = now_ms();
+    while (!stop_requested() &&
+           !__atomic_load_n(&stream->reader_stop, __ATOMIC_ACQUIRE)) {
+        uint8_t *buffer = NULL;
+        size_t capacity = ring_write_acquire(&stream->ring, &buffer);
+        if (capacity == 0) {
+            last_data_ms = now_ms();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (capacity > RADIO_INPUT_BYTES) capacity = RADIO_INPUT_BYTES;
+        int read = esp_http_client_read(stream->client, (char *)buffer,
+                                       (int)capacity);
+        if (read == -ESP_ERR_HTTP_EAGAIN) {
+            if (now_ms() - last_data_ms >= RADIO_STALL_TIMEOUT_MS) {
+                result = ESP_ERR_TIMEOUT;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (read <= 0) {
+            ESP_LOGW(TAG, "HTTP stream ended read=%d errno=%d", read,
+                     esp_http_client_get_errno(stream->client));
+            result = read == 0 ? ESP_ERR_INVALID_RESPONSE : ESP_FAIL;
+            break;
+        }
+        last_data_ms = now_ms();
+        ring_write_commit(&stream->ring,
+                          strip_metadata(stream, buffer, (size_t)read));
+    }
+    stream->reader_result = result;
+    __atomic_store_n(&stream->reader_done, true, __ATOMIC_RELEASE);
+    vTaskDeleteWithCaps(NULL);
+}
+
+static esp_err_t decode_stream(radio_stream_t *stream) {
+    uint8_t *network = heap_caps_malloc(RADIO_NETWORK_BYTES,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *input = heap_caps_malloc(RADIO_INPUT_BYTES,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *output = heap_caps_malloc(RADIO_OUTPUT_BYTES,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!network || !input || !output) {
+        free(network);
         free(input);
         free(output);
         return ESP_ERR_NO_MEM;
     }
+    ring_init(&stream->ring, network, RADIO_NETWORK_BYTES);
 
     esp_audio_simple_dec_handle_t decoder = NULL;
     esp_audio_simple_dec_cfg_t decoder_cfg = {
@@ -201,6 +311,7 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
         esp_audio_simple_dec_open(&decoder_cfg, &decoder);
     if (decoder_err != ESP_AUDIO_ERR_OK) {
         ESP_LOGE(TAG, "decoder open failed: %d", decoder_err);
+        free(network);
         free(input);
         free(output);
         return ESP_FAIL;
@@ -208,23 +319,50 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
 
     bool format_ready = false;
     bool playback_started = false;
+    bool network_prefilled = false;
     size_t prefill_bytes = 0;
+    size_t prefill_target = 0;
+    uint8_t channels = 0;
+    uint32_t underruns = 0;
     esp_err_t result = ESP_OK;
     set_state(RADIO_PLAYER_BUFFERING, "正在缓冲");
 
-    while (!stop_requested()) {
-        int read = esp_http_client_read(client, (char *)input,
-                                        RADIO_INPUT_BYTES);
-        if (read == -ESP_ERR_HTTP_EAGAIN) continue;
-        if (read < 0) {
-            result = ESP_FAIL;
-            break;
-        }
-        if (read == 0) {
-            result = ESP_ERR_INVALID_RESPONSE;
-            break;
-        }
+    if (xTaskCreatePinnedToCoreWithCaps(stream_reader, "radio_http",
+                               RADIO_READER_STACK_BYTES, stream,
+                               RADIO_TASK_PRIORITY, NULL,
+                               RADIO_TASK_CORE,
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        esp_audio_simple_dec_close(decoder);
+        free(network);
+        free(input);
+        free(output);
+        return ESP_ERR_NO_MEM;
+    }
 
+    while (!stop_requested()) {
+        bool reader_done =
+            __atomic_load_n(&stream->reader_done, __ATOMIC_ACQUIRE);
+        size_t available = ring_available(&stream->ring);
+        if ((!network_prefilled && available < RADIO_NETWORK_PREFILL_BYTES &&
+             !reader_done) || available == 0) {
+            if (reader_done && available == 0) {
+                result = stream->reader_result;
+                break;
+            }
+            if (playback_started && audio_io_spk_underrun() != underruns) {
+                ESP_LOGW(TAG, "network buffer exhausted; rebuffering");
+                result = audio_io_stop_playback(2000);
+                if (result != ESP_OK) break;
+                playback_started = false;
+                network_prefilled = false;
+                prefill_bytes = 0;
+                set_state(RADIO_PLAYER_BUFFERING, "网络慢，重新缓冲");
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        network_prefilled = true;
+        size_t read = ring_read(&stream->ring, input, RADIO_INPUT_BYTES);
         esp_audio_simple_dec_raw_t raw = {
             .buffer = input,
             .len = (uint32_t)read,
@@ -244,7 +382,10 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
             }
             if (decoder_err != ESP_AUDIO_ERR_OK) {
                 ESP_LOGE(TAG, "MP3 decode failed: %d", decoder_err);
-                result = ESP_FAIL;
+                result = decoder_err == ESP_AUDIO_ERR_NOT_SUPPORT
+                             ? ESP_ERR_NOT_SUPPORTED
+                         : decoder_err == ESP_AUDIO_ERR_MEM_LACK
+                             ? ESP_ERR_NO_MEM : ESP_FAIL;
                 break;
             }
             if (frame.decoded_size > 0) {
@@ -263,17 +404,28 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
                                                       info.channel, playback_cancelled, NULL);
                     if (result != ESP_OK) break;
                     set_format(&info);
+                    prefill_target = (size_t)info.sample_rate * info.channel *
+                                     sizeof(int16_t) * RADIO_PREFILL_MS / 1000;
+                    if (prefill_target > APP_SPEAKER_BUFFER_BYTES - RADIO_OUTPUT_BYTES) {
+                        prefill_target = APP_SPEAKER_BUFFER_BYTES - RADIO_OUTPUT_BYTES;
+                    }
+                    mem_log("radio PCM ready");
+                    channels = info.channel;
                     format_ready = true;
                 }
+                bool was_started = playback_started;
                 result = push_pcm(frame.buffer, frame.decoded_size,
-                                  s_snapshot.channels,
-                                  &playback_started, &prefill_bytes);
+                                  channels,
+                                  &playback_started, &prefill_bytes, prefill_target);
                 if (result != ESP_OK) break;
-            }
-            if (raw.consumed == 0) {
-                if (frame.decoded_size == 0) {
-                    result = ESP_ERR_INVALID_RESPONSE;
+                if (!was_started && playback_started) {
+                    underruns = audio_io_spk_underrun();
                 }
+            }
+            if (raw.consumed > raw.len ||
+                (raw.consumed == 0 && frame.decoded_size == 0)) {
+                ESP_LOGE(TAG, "decoder made no progress or consumed invalid size");
+                result = ESP_ERR_INVALID_RESPONSE;
                 break;
             }
             raw.buffer += raw.consumed;
@@ -282,21 +434,63 @@ static esp_err_t decode_stream(esp_http_client_handle_t client) {
         if (result != ESP_OK) break;
     }
 
-    if (!stop_requested() && !playback_started && prefill_bytes > 0 && result == ESP_OK) {
-        result = audio_io_start_playback_cancellable(2000, playback_cancelled, NULL);
-        playback_started = result == ESP_OK;
+    __atomic_store_n(&stream->reader_stop, true, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&stream->reader_done, __ATOMIC_ACQUIRE)) {
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    if (playback_started) {
-        if (stop_requested()) {
-            audio_io_abort(2000);
-        } else {
-            audio_io_stop_playback(3000);
-        }
+    if (stop_requested() || result != ESP_OK) {
+        audio_io_abort(2000);
+    } else if (playback_started) {
+        result = audio_io_stop_playback(3000);
+        if (result != ESP_OK) audio_io_abort(2000);
     }
     esp_audio_simple_dec_close(decoder);
+    free(network);
     free(input);
     free(output);
     return result;
+}
+
+static esp_err_t open_stream(radio_stream_t *stream, const char *station_name,
+                             bool *retryable) {
+    for (int redirects = 0; redirects <= RADIO_MAX_REDIRECTS; ++redirects) {
+        if (stop_requested()) return ESP_ERR_INVALID_STATE;
+        stream->metadata_interval = 0;
+        stream->audio_remaining = 0;
+        stream->metadata_remaining = 0;
+        stream->header_result = ESP_OK;
+        esp_err_t result = esp_http_client_open(stream->client, 0);
+        if (result != ESP_OK) return result;
+        int64_t length = esp_http_client_fetch_headers(stream->client);
+        if (length < 0) return ESP_ERR_HTTP_FETCH_HEADER;
+        int status = esp_http_client_get_status_code(stream->client);
+        ESP_LOGI(TAG, "%s HTTP %d length=%lld", station_name, status,
+                 (long long)length);
+        if (status == 200 || status == 206) {
+            *retryable = stream->header_result == ESP_OK;
+            return stream->header_result;
+        }
+        if (status == 301 || status == 302 || status == 303 ||
+            status == 307 || status == 308) {
+            if (redirects == RADIO_MAX_REDIRECTS) {
+                *retryable = false;
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            result = esp_http_client_set_redirection(stream->client);
+            if (result != ESP_OK) {
+                *retryable = false;
+                return result;
+            }
+            esp_http_client_close(stream->client);
+            continue;
+        }
+        *retryable = status == 408 || status == 429 || status >= 500;
+        char message[48];
+        snprintf(message, sizeof(message), "电台 HTTP %d", status);
+        set_state(RADIO_PLAYER_ERROR, message);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_ERR_INVALID_RESPONSE;
 }
 
 static void radio_task(void *arg) {
@@ -309,6 +503,7 @@ static void radio_task(void *arg) {
         return;
     }
 
+    radio_stream_t stream = {0};
     esp_http_client_config_t config = {
         .url = station->url,
         .timeout_ms = RADIO_HTTP_TIMEOUT_MS,
@@ -317,45 +512,60 @@ static void radio_task(void *arg) {
         .skip_cert_common_name_check = true,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .keep_alive_enable = true,
-        .disable_auto_redirect = false,
-        .max_redirection_count = 4,
+        .disable_auto_redirect = true,
+        .max_redirection_count = RADIO_MAX_REDIRECTS,
+        .event_handler = http_event,
+        .user_data = &stream,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        if (stop_requested()) set_state(RADIO_PLAYER_IDLE, "已停止");
-        else set_state(RADIO_PLAYER_ERROR, "HTTP 初始化失败");
-        finish_task();
-        return;
-    }
-
-    esp_http_client_set_method(client, HTTP_METHOD_GET);
-    esp_http_client_set_header(client, "Accept", "audio/mpeg");
-    esp_http_client_set_header(client, "Icy-MetaData", "0");
-    esp_http_client_set_header(client, "User-Agent", "TalkingAlarm/1.0");
-
-    set_state(RADIO_PLAYER_CONNECTING, "正在连接");
-    result = stop_requested() ? ESP_ERR_INVALID_STATE : esp_http_client_open(client, 0);
-    if (!stop_requested() && result == ESP_OK) {
-        int64_t content_length = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "%s HTTP %d length=%lld", station->name, status,
-                 (long long)content_length);
-        if (!stop_requested() && (status == 200 || status == 206)) {
-            result = decode_stream(client);
-        } else {
-            result = ESP_ERR_INVALID_RESPONSE;
+    for (int attempt = 0; attempt <= RADIO_MAX_RETRIES && !stop_requested();
+         ++attempt) {
+        stream = (radio_stream_t){0};
+        stream.client = esp_http_client_init(&config);
+        if (!stream.client) {
+            result = ESP_ERR_NO_MEM;
+            break;
+        }
+        esp_http_client_set_method(stream.client, HTTP_METHOD_GET);
+        esp_http_client_set_header(stream.client, "Accept", "audio/mpeg");
+        esp_http_client_set_header(stream.client, "Icy-MetaData", "0");
+        esp_http_client_set_header(stream.client, "User-Agent", "TalkingAlarm/1.0");
+        set_state(RADIO_PLAYER_CONNECTING, "正在连接");
+        bool retryable = true;
+        result = open_stream(&stream, station->name, &retryable);
+        if (!stop_requested() && result == ESP_OK) {
+            result = decode_stream(&stream);
+        }
+        esp_http_client_close(stream.client);
+        esp_http_client_cleanup(stream.client);
+        if (stop_requested() || result == ESP_OK || !retryable ||
+            result == ESP_ERR_NO_MEM || result == ESP_ERR_NOT_SUPPORTED ||
+            attempt == RADIO_MAX_RETRIES) break;
+        ESP_LOGW(TAG, "stream interrupted: %s; retry %d/%d",
+                 esp_err_to_name(result), attempt + 1, RADIO_MAX_RETRIES);
+        char message[48];
+        snprintf(message, sizeof(message), "重连 %d/%d", attempt + 1,
+                 RADIO_MAX_RETRIES);
+        set_state(RADIO_PLAYER_CONNECTING, message);
+        int64_t retry_at = now_ms() + (1000 << attempt);
+        while (!stop_requested() && now_ms() < retry_at) {
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
     if (stop_requested()) {
         set_state(RADIO_PLAYER_IDLE, "已停止");
     } else if (result == ESP_OK) {
         set_state(RADIO_PLAYER_IDLE, "播放结束");
     } else {
         ESP_LOGE(TAG, "stream failed: %s", esp_err_to_name(result));
-        set_state(RADIO_PLAYER_ERROR, "连接或解码失败");
+        radio_player_snapshot_t snapshot;
+        radio_player_get_snapshot(&snapshot);
+        if (snapshot.state != RADIO_PLAYER_ERROR) {
+            set_state(RADIO_PLAYER_ERROR,
+                      result == ESP_ERR_NO_MEM ? "播放器内存不足"
+                      : result == ESP_ERR_NOT_SUPPORTED ? "电台格式不支持"
+                      : result == ESP_ERR_TIMEOUT ? "网络超时，请重试"
+                      : "连接或解码失败，请重试");
+        }
     }
     finish_task();
 }
@@ -370,8 +580,8 @@ esp_err_t radio_player_init(void) {
 esp_err_t radio_player_start(size_t station_index) {
     if (!radio_station_get(station_index)) return ESP_ERR_INVALID_ARG;
     taskENTER_CRITICAL(&s_lock);
-    if (radio_player_busy() || audio_io_is_suspended() ||
-        audio_io_phase() != AUDIO_PHASE_IDLE) {
+    if (radio_player_busy() ||
+        audio_io_acquire_owner(AUDIO_OWNER_RADIO) != ESP_OK) {
         taskEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -389,13 +599,14 @@ esp_err_t radio_player_start(size_t station_index) {
     ++s_snapshot.generation;
     taskEXIT_CRITICAL(&s_lock);
 
-    BaseType_t created = xTaskCreatePinnedToCore(
+    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
         radio_task, "radio_player", RADIO_TASK_STACK_BYTES,
         (void *)(uintptr_t)station_index, RADIO_TASK_PRIORITY, &s_task,
-        RADIO_TASK_CORE);
+        RADIO_TASK_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         if (stop_requested()) set_state(RADIO_PLAYER_IDLE, "已停止");
         else set_state(RADIO_PLAYER_ERROR, "播放器任务创建失败");
+        audio_io_release_owner(AUDIO_OWNER_RADIO);
         __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
         return ESP_ERR_NO_MEM;
     }
