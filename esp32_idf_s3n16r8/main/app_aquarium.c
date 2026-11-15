@@ -10,9 +10,12 @@
 #include <math.h>
 #include <stdio.h>
 
-#define FISH_MAX 32
+#define FISH_MAX 12
+#define FISH_DEFAULT 5
 #define FISH_STEP 1
 #define FRAME_MS 66
+#define FOOD_FALL_SPEED 8.0f
+#define FOOD_EAT_RADIUS 14.0f
 #define TANK_X 4
 #define TANK_Y 34
 #define TANK_W 312
@@ -30,12 +33,14 @@ typedef struct {
 typedef struct {
     fish_t fish[FISH_MAX];
     fish_t next[FISH_MAX];
+    bool food_active;
+    float food_x, food_y;
     uint16_t pixels[TANK_W * TANK_H];
 } school_t;
 
 static const char *TAG = "aquarium";
 static school_t *s_school;
-static int s_count = 12;
+static int s_count = FISH_DEFAULT;
 static int64_t s_last_frame_ms;
 static unsigned s_frame;
 
@@ -70,7 +75,49 @@ static void exit_app(void) {
     s_school = NULL;
 }
 
-static void step_school(float dt) {
+static bool drop_food(void) {
+    if (s_school->food_active) return false;
+    s_school->food_x = TANK_LEFT + random_unit() * (TANK_RIGHT - TANK_LEFT);
+    s_school->food_y = TANK_TOP;
+    s_school->food_active = true;
+    return true;
+}
+
+static int first_food_eater(float previous_food_y) {
+    int eater = -1;
+    float earliest = 2.0f;
+    for (int i = 0; i < s_count; ++i) {
+        fish_t previous = s_school->fish[i];
+        fish_t next = s_school->next[i];
+        float x = previous.x - s_school->food_x;
+        float y = previous.y - previous_food_y;
+        float dx = next.x - previous.x;
+        float dy = next.y - previous.y - (s_school->food_y - previous_food_y);
+        float c = x * x + y * y - FOOD_EAT_RADIUS * FOOD_EAT_RADIUS;
+        float arrival = 0.0f;
+        if (c > 0) {
+            float a = dx * dx + dy * dy;
+            float b = x * dx + y * dy;
+            float discriminant = b * b - a * c;
+            if (a < 0.000001f || b >= 0 || discriminant < 0) continue;
+            arrival = (-b - sqrtf(discriminant)) / a;
+            if (arrival < 0 || arrival > 1) continue;
+        }
+        if (arrival < earliest) {
+            earliest = arrival;
+            eater = i;
+        }
+    }
+    return eater;
+}
+
+static bool step_school(float dt) {
+    bool eaten = false;
+    float previous_food_y = s_school->food_y;
+    if (s_school->food_active) {
+        s_school->food_y = fminf(TANK_BOTTOM,
+                                 s_school->food_y + FOOD_FALL_SPEED * dt);
+    }
     for (int i = 0; i < s_count; ++i) {
         fish_t fish = s_school->fish[i];
         float sx = 0, sy = 0, ax = 0, ay = 0, cx = 0, cy = 0;
@@ -108,6 +155,15 @@ static void step_school(float dt) {
         if (fish.x > TANK_RIGHT - 30) fx -= (fish.x - TANK_RIGHT + 30) * 2;
         if (fish.y < TANK_TOP + 20) fy += (TANK_TOP + 20 - fish.y) * 2;
         if (fish.y > TANK_BOTTOM - 20) fy -= (fish.y - TANK_BOTTOM + 20) * 2;
+        if (s_school->food_active) {
+            float dx = s_school->food_x - fish.x;
+            float dy = s_school->food_y - fish.y;
+            float distance = sqrtf(dx * dx + dy * dy);
+            if (distance > 0.01f) {
+                fx = fx * 0.15f + (dx * 32.0f / distance - fish.vx) * 5.0f;
+                fy = fy * 0.15f + (dy * 32.0f / distance - fish.vy) * 5.0f;
+            }
+        }
         fish.vx += fx * dt;
         fish.vy += fy * dt;
         float speed = sqrtf(fish.vx * fish.vx + fish.vy * fish.vy);
@@ -130,9 +186,19 @@ static void step_school(float dt) {
         }
         s_school->next[i] = fish;
     }
+    if (s_school->food_active) {
+        // Compare within-step arrival times, not fish array order.
+        int eater = first_food_eater(previous_food_y);
+        if (eater >= 0) {
+            s_school->food_active = false;
+            eaten = true;
+            ESP_LOGI(TAG, "fish %d ate the food", eater + 1);
+        }
+    }
     for (int i = 0; i < s_count; ++i) {
         s_school->fish[i] = s_school->next[i];
     }
+    return eaten;
 }
 
 static gui_action_t tick(int64_t now_ms) {
@@ -141,9 +207,26 @@ static gui_action_t tick(int64_t now_ms) {
     int64_t elapsed = now_ms - s_last_frame_ms;
     if (elapsed < FRAME_MS) return GUI_ACTION_NONE;
     s_last_frame_ms = now_ms;
-    step_school((float)(elapsed > 100 ? 100 : elapsed) / 1000.0f);
+    bool eaten = step_school((float)(elapsed > 100 ? 100 : elapsed) / 1000.0f);
     ++s_frame;
-    return GUI_ACTION_REDRAW;
+    return eaten ? GUI_ACTION_AQUARIUM_EATEN : GUI_ACTION_REDRAW;
+}
+
+static void composite_sprite(int x, int y, int width, int height,
+                              const uint16_t *pixels, const uint8_t *alpha,
+                              bool mirror) {
+    x -= TANK_X;
+    y -= TANK_Y;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            int px = x + col, py = y + row;
+            if (px < 0 || py < 0 || px >= TANK_W || py >= TANK_H) continue;
+            size_t source = (size_t)row * width + (mirror ? width - 1 - col : col);
+            size_t target = (size_t)py * TANK_W + px;
+            s_school->pixels[target] = rgb565_blend(
+                pixels[source], s_school->pixels[target], alpha[source]);
+        }
+    }
 }
 
 static esp_err_t render_overlay(void) {
@@ -153,21 +236,18 @@ static esp_err_t render_overlay(void) {
     if (err != ESP_OK) return err;
     for (int i = 0; i < s_count; ++i) {
         fish_t fish = s_school->fish[i];
-        int x = (int)fish.x - FISH_ORANGE_W / 2 - TANK_X;
-        int y = (int)fish.y - FISH_ORANGE_H / 2 - TANK_Y;
+        int x = (int)fish.x - FISH_ORANGE_W / 2;
+        int y = (int)fish.y - FISH_ORANGE_H / 2;
         const uint16_t *pixels = i % 2 ? s_fish_purple_rgb565 : s_fish_orange_rgb565;
         const uint8_t *alpha = i % 2 ? s_fish_purple_alpha : s_fish_orange_alpha;
-        for (int row = 0; row < FISH_ORANGE_H; ++row) {
-            for (int col = 0; col < FISH_ORANGE_W; ++col) {
-                int px = x + col, py = y + row;
-                if (px < 0 || py < 0 || px >= TANK_W || py >= TANK_H) continue;
-                int source = row * FISH_ORANGE_W +
-                             (fish.vx > 0 ? FISH_ORANGE_W - 1 - col : col);
-                size_t target = (size_t)py * TANK_W + px;
-                s_school->pixels[target] = rgb565_blend(
-                    pixels[source], s_school->pixels[target], alpha[source]);
-            }
-        }
+        composite_sprite(x, y, FISH_ORANGE_W, FISH_ORANGE_H, pixels, alpha,
+                          fish.vx > 0);
+    }
+    if (s_school->food_active) {
+        composite_sprite((int)s_school->food_x - FOOD_WORM_W / 2,
+                          (int)s_school->food_y - FOOD_WORM_H / 2,
+                          FOOD_WORM_W, FOOD_WORM_H,
+                          s_food_worm_rgb565, s_food_worm_alpha, false);
     }
     return ui_draw_rgb565_bitmap(TANK_X, TANK_Y, TANK_W, TANK_H,
                                  s_school->pixels, NULL, UI_COLOR_PRIMARY_DARK);
@@ -179,7 +259,7 @@ static void render(const gui_model_t *model, int focused_item) {
     ui_draw_text(12, 8, "小鱼缸", 2, UI_COLOR_TEXT);
     char count[32];
     snprintf(count, sizeof(count), "%d / %d 条", s_count, FISH_MAX);
-    ui_draw_text(132, 10, count, 1, UI_COLOR_CYAN);
+    ui_draw_text(88, 10, count, 1, UI_COLOR_CYAN);
     ui_fill_round_rect(TANK_X, TANK_Y, TANK_W, TANK_H, 8, UI_COLOR_PRIMARY_DARK);
     ui_draw_line(TANK_X + 10, TANK_Y + 6,
                  TANK_X + TANK_W - 10, TANK_Y + 6, UI_COLOR_CYAN);
@@ -201,15 +281,17 @@ static void render(const gui_model_t *model, int focused_item) {
     if (!s_school) {
         ui_draw_text(65, 92, "内存不足，请返回后重试", 1, UI_COLOR_DANGER);
     }
-    const char *labels[] = {"-", "+"};
-    for (int i = 0; i < 2; ++i) {
-        int x = 236 + i * 42;
+    const char *labels[] = {"-", "+",
+                            s_school && s_school->food_active ? "追食" : "喂食"};
+    for (int i = 0; i < 3; ++i) {
+        int x = i == 2 ? 262 : 182 + i * 40;
+        int width = i == 2 ? 52 : 32;
         bool focus = focused_item == i;
-        ui_fill_round_rect(x, 5, 32, 22, 4,
+        ui_fill_round_rect(x, 5, width, 22, 4,
                            focus ? UI_COLOR_PRIMARY_DARK : UI_COLOR_PANEL);
-        ui_draw_rect(x, 5, 32, 22, focus ? 2 : 1,
+        ui_draw_rect(x, 5, width, 22, focus ? 2 : 1,
                      focus ? UI_COLOR_FOCUS : UI_COLOR_PANEL_ALT);
-        ui_draw_text(x + 10, 9, labels[i], 2,
+        ui_draw_text(x + 10, 9, labels[i], i == 2 ? 1 : 2,
                      focus ? UI_COLOR_FOCUS : UI_COLOR_TEXT);
     }
 }
@@ -221,19 +303,21 @@ static gui_action_t activate(uint8_t item) {
         for (int i = s_count; i < s_count + FISH_STEP; ++i) add_fish(i);
         s_count += FISH_STEP;
     }
+    if (item == 2 && drop_food()) return GUI_ACTION_AQUARIUM_DROP;
     return GUI_ACTION_REDRAW;
 }
 
 static const gui_focus_node_t s_focus_grid[] = {
     {.left = GUI_FOCUS_HOME, .right = 1, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
-    {.left = 0, .right = GUI_FOCUS_HOME, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
+    {.left = 0, .right = 2, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
+    {.left = 1, .right = GUI_FOCUS_HOME, .up = GUI_FOCUS_HOME, .down = GUI_FOCUS_HOME},
 };
 
 static const gui_app_t s_app = {
     .id = "aquarium",
     .label = "小鱼缸",
     .icon = GUI_ICON_AQUARIUM,
-    .focus_count = 2,
+    .focus_count = 3,
     .focus_grid = s_focus_grid,
     .enter = enter,
     .exit = exit_app,

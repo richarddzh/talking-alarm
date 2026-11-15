@@ -13,6 +13,12 @@ typedef enum {
     CHIME_ERROR,
 } chime_status_t;
 
+typedef enum {
+    CHIME_EFFECT_NONE = 0,
+    CHIME_EFFECT_WATER_DROP,
+    CHIME_EFFECT_BUBBLE,
+} chime_effect_t;
+
 esp_err_t chime_player_init(void);
 bool      chime_player_busy(void);
 // Nonblocking, sticky for the accepted job. Busy stays true through network
@@ -26,6 +32,9 @@ esp_err_t  chime_player_start(const char *time_arg);
 // the agent step. Used for short spoken announcements such as quiet-mode
 // enter/exit prompts. Rejects if the player or audio pipeline is busy.
 esp_err_t  chime_player_start_text(const char *text);
+// Local synthesized PCM, no network/API dependency. Uses the same worker,
+// audio ownership and cancellation as speech; rejects concurrent audio jobs.
+esp_err_t  chime_player_start_effect(chime_effect_t effect);
 
 typedef void (*chime_player_status_cb_t)(void *ctx);
 void chime_player_set_status_cb(chime_player_status_cb_t cb, void *ctx);

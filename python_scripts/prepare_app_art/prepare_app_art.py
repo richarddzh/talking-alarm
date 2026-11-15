@@ -138,8 +138,11 @@ def main():
     tomato = remove_footer_strip(Image.open(REFERENCES / "tomato_face.png"))
     tomato = clean(largest_component(remove_background(tomato, (255, 255, 255), 20)))
     clock = Image.open(REFERENCES / "tomato_clock.png").convert("RGBA")
+    worm = Image.open(REFERENCES / "food_worm.png")
+    worm = clean(largest_component(remove_background(worm, (245, 245, 245), 25)))
     for name, image in (("fish_orange", orange), ("fish_purple", purple),
-                        ("tomato_face", tomato), ("tomato_clock", clock)):
+                        ("tomato_face", tomato), ("tomato_clock", clock),
+                        ("food_worm", worm)):
         image.save(OUTPUT / f"{name}_cutout.png")
     fit(orange, (256, 256)).save(ASSETS / "launcher_icons" / "aquarium.png")
     fit(tomato, (256, 256)).save(ASSETS / "launcher_icons" / "pomodoro.png")
@@ -153,6 +156,7 @@ def main():
         "fish_purple": fit(purple, (40, 30)),
         "tomato_face": fit(tomato, (34, 34)),
         "tomato_clock": fit(clock_frame, (144, 144)),
+        "food_worm": fit(worm, (14, 14)),
     }
     for name, image in images.items():
         image.save(OUTPUT / f"{name}_display.png")

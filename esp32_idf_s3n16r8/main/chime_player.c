@@ -2,7 +2,9 @@
 #include "audio_io.h"
 #include "doubao_agent_client.h"
 #include "doubao_tts_player.h"
+#include "app_config.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
@@ -25,6 +27,7 @@ static char s_msg[48] = "chime idle";
 static char s_time_arg[16];
 static char s_fixed_text[256];
 static bool s_text_only;
+static chime_effect_t s_effect;
 static chime_player_status_cb_t s_status_cb;
 static void *s_status_ctx;
 static chime_player_text_cb_t s_text_cb;
@@ -81,6 +84,49 @@ static void chime_tts_status(void *ctx, const char *msg) {
     }
 }
 
+static esp_err_t play_effect(chime_effect_t effect) {
+    const uint32_t rate = APP_VOICE_SAMPLE_RATE;
+    const size_t frames = rate * (effect == CHIME_EFFECT_WATER_DROP ? 180 : 140) / 1000;
+    esp_err_t err = audio_io_prepare_speaker_cancellable(rate, 1, cancelled, NULL);
+    if (err != ESP_OK) return err;
+    float phase = 0.0f;
+    size_t produced = 0;
+    while (produced < frames) {
+        if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+        uint8_t *buffer = NULL;
+        size_t available = audio_io_reserve_speaker(&buffer, 250);
+        if (available < sizeof(int16_t)) {
+            return cancelled(NULL) ? ESP_ERR_INVALID_STATE : ESP_ERR_TIMEOUT;
+        }
+        size_t count = available / sizeof(int16_t);
+        if (count > frames - produced) count = frames - produced;
+        int16_t *samples = (int16_t *)buffer;
+        for (size_t i = 0; i < count; ++i) {
+            size_t frame = produced + i;
+            float t = (float)frame / (float)(frames - 1);
+            float frequency = effect == CHIME_EFFECT_WATER_DROP
+                                  ? 2100.0f - 1500.0f * t
+                                  : 450.0f + 1500.0f * t;
+            float attack = fminf((float)frame / (rate * 0.004f), 1.0f);
+            float envelope = attack * (1.0f - t) * (1.0f - t);
+            samples[i] = (int16_t)(6500.0f * envelope *
+                                   (sinf(phase) + 0.18f * sinf(2.0f * phase)));
+            phase += 6.28318530718f * frequency / rate;
+            if (phase >= 6.28318530718f) phase -= 6.28318530718f;
+        }
+        if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+        audio_io_commit_speaker(count * sizeof(*samples));
+        produced += count;
+    }
+    if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+    set_status(CHIME_PLAYING, effect == CHIME_EFFECT_WATER_DROP
+                                  ? "water drop" : "bubble");
+    err = audio_io_start_playback_cancellable(1000, cancelled, NULL);
+    if (err != ESP_OK) return err;
+    set_status(CHIME_DRAINING, "drain effect");
+    return audio_io_stop_playback(2000);
+}
+
 static void chime_worker(void *arg) {
     (void)arg;
     for (;;) {
@@ -89,6 +135,10 @@ static void chime_worker(void *arg) {
         char *text = NULL;
         esp_err_t err = ESP_ERR_INVALID_STATE;
         if (cancelled(NULL)) goto done;
+        if (s_effect != CHIME_EFFECT_NONE) {
+            err = play_effect(s_effect);
+            goto done;
+        }
 
         if (!s_text_only) {
             set_status(CHIME_WAITING_REPLY, "agent chime");
@@ -107,6 +157,7 @@ static void chime_worker(void *arg) {
 done:
         free(text);
         s_text_only = false;
+        s_effect = CHIME_EFFECT_NONE;
         s_fixed_text[0] = 0;
         if (cancelled(NULL)) {
             audio_io_abort(2000);
@@ -154,6 +205,7 @@ esp_err_t chime_player_start(const char *time_arg) {
         s_time_arg[0] = 0;
     }
     s_text_only = false;
+    s_effect = CHIME_EFFECT_NONE;
     s_fixed_text[0] = 0;
     set_status(CHIME_CONNECTING, "start chime");
     xTaskNotifyGive(s_worker_task);
@@ -167,8 +219,24 @@ esp_err_t chime_player_start_text(const char *text) {
     strncpy(s_fixed_text, text, sizeof(s_fixed_text) - 1);
     s_fixed_text[sizeof(s_fixed_text) - 1] = 0;
     s_text_only = true;
+    s_effect = CHIME_EFFECT_NONE;
     s_time_arg[0] = 0;
     set_status(CHIME_CONNECTING, "start tts");
+    xTaskNotifyGive(s_worker_task);
+    return ESP_OK;
+}
+
+esp_err_t chime_player_start_effect(chime_effect_t effect) {
+    if (effect != CHIME_EFFECT_WATER_DROP && effect != CHIME_EFFECT_BUBBLE) {
+        ESP_LOGE(TAG, "invalid local effect: %d", (int)effect);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_worker_task || !begin_job()) return ESP_ERR_INVALID_STATE;
+    s_effect = effect;
+    s_text_only = false;
+    s_time_arg[0] = 0;
+    s_fixed_text[0] = 0;
+    set_status(CHIME_CONNECTING, "start local effect");
     xTaskNotifyGive(s_worker_task);
     return ESP_OK;
 }

@@ -120,6 +120,10 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
 主循环检查安静/省电/配置模式和网络，忙时最多等待 30 秒，不抢占电台或录音；
 休眠暂停倒计时并取消待播报。细节见 [aquarium_pomodoro.md](aquarium_pomodoro.md)。
 
+鱼缸水滴/气泡使用 `chime_player_start_effect()`，与语音共用 CHIME owner、
+worker 和 PCM ring，但本地合成而不联网。取消和错误路径与语音相同；主循环
+只为鱼缸自身正在播放的短音效保留至多两个待播事件，其它音频 busy 时不抢占。
+
 ## 超时和错误恢复
 
 - ASR 发送失败：关闭 ASR session，停止录音；停止超时则请求底层 abort。

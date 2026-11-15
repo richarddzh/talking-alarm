@@ -96,6 +96,10 @@ static bool s_sleep_hourly_active;
 static bool s_resume_radio;
 static size_t s_resume_radio_station;
 static bool s_pomodoro_speaking;
+static chime_effect_t s_aquarium_effects[2];
+static unsigned s_aquarium_effect_count;
+static int64_t s_aquarium_effect_expires_ms;
+static bool s_aquarium_effect_playing;
 
 static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -625,6 +629,36 @@ static void maybe_announce_pomodoro(void) {
     }
 }
 
+static void maybe_play_aquarium_effect(void) {
+    if (s_aquarium_effect_playing && !chime_player_busy()) {
+        s_aquarium_effect_playing = false;
+    }
+    if (s_aquarium_effect_count == 0) return;
+    if (s_quiet_mode || s_power_state != IDLE_POWER_AWAKE || s_setup_mode ||
+        wifi_provision_active() || !gui_shell_current_app_is("aquarium") ||
+        now_ms() >= s_aquarium_effect_expires_ms) {
+        ESP_LOGI(TAG, "aquarium effects discarded by mute/power/page/expiry");
+        s_aquarium_effect_count = 0;
+        return;
+    }
+    if (s_aquarium_effect_playing) return;
+    if (audio_activity_busy()) {
+        ESP_LOGI(TAG, "aquarium effects skipped while other audio is busy");
+        s_aquarium_effect_count = 0;
+        return;
+    }
+    chime_effect_t effect = s_aquarium_effects[0];
+    --s_aquarium_effect_count;
+    s_aquarium_effects[0] = s_aquarium_effects[1];
+    esp_err_t err = chime_player_start_effect(effect);
+    if (err == ESP_OK) {
+        s_aquarium_effect_playing = true;
+    } else {
+        ESP_LOGW(TAG, "aquarium effect rejected: %s", esp_err_to_name(err));
+        s_aquarium_effect_count = 0;
+    }
+}
+
 // --- Single-button gestures --------------------------------------------
 static void toggle_quiet_mode(void) {
     s_quiet_mode = !s_quiet_mode;
@@ -637,6 +671,18 @@ static void toggle_quiet_mode(void) {
 static void dispatch_gui_action(gui_action_t action) {
     switch (action) {
     case GUI_ACTION_REDRAW:
+        render_home();
+        break;
+    case GUI_ACTION_AQUARIUM_DROP:
+    case GUI_ACTION_AQUARIUM_EATEN:
+        if (s_aquarium_effect_count < 2) {
+            s_aquarium_effects[s_aquarium_effect_count++] =
+                action == GUI_ACTION_AQUARIUM_DROP
+                    ? CHIME_EFFECT_WATER_DROP : CHIME_EFFECT_BUBBLE;
+            s_aquarium_effect_expires_ms = now_ms() + 1500;
+        } else {
+            ESP_LOGI(TAG, "aquarium effect queue full");
+        }
         render_home();
         break;
     case GUI_ACTION_CHIME:
@@ -917,6 +963,7 @@ void app_main(void) {
         if (s_power_state == IDLE_POWER_AWAKE) {
             dispatch_gui_action(gui_shell_tick(now_ms()));
         }
+        maybe_play_aquarium_effect();
         if (s_setup_mode) {
             poll_wifi_provision();
             vTaskDelay(pdMS_TO_TICKS(20));

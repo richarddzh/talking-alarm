@@ -48,7 +48,8 @@ PSRAM 是外部 RAM，不是文件系统。大块 PCM、网络报文、文本、
 | 当前帧 / 上一帧 | 各 38400 B PSRAM | UI 初始化分配，保留用于差分刷新 |
 | 配网页 / 表单 | 4096 / 1600 B PSRAM | HTTP 请求结束释放，配置服务器固定在 Core 0 |
 | Wi-Fi 扫描临时记录 | 最多 32 个，PSRAM | 扫描转换为 UI 结果后释放 |
-| 小鱼缸模拟双缓冲及 RGB565 水域 | 108352 B PSRAM | 进入 App 分配，离开/息屏/休眠释放 |
+| 小鱼缸模拟双缓冲、单食物状态及 RGB565 水域 | 107724 B PSRAM | 最多12条鱼，进入 App 分配，离开/息屏/休眠释放 |
+| 鱼缸水滴／气泡音效 | 5760 / 4480 B PCM | 临时占用现有共享音频 ring，无独立 PCM 分配 |
 | 番茄时钟 deadline / 状态 / 提醒指针 | 少量静态内部 RAM | 主循环更新，无新增任务、网络缓冲或 PCM arena |
 
 明确分配的常驻 PSRAM 约 345 KB：音频 256 KB、UI 75 KB、
@@ -59,6 +60,9 @@ Wi-Fi、lwIP、HTTPD 等 SDK 任务仍由 SDK 管理其栈；本约定中的 PSR
 worker 栈指应用自己创建的网络/解码任务。
 小鱼缸和番茄时钟的原图 RGB565/alpha 常量位于 Flash；七个启动器图标
 共约 47.25 KB Flash。图层和应用行为见 [aquarium_pomodoro.md](aquarium_pomodoro.md)。
+14×14 鱼虫精灵另占 588 B Flash；主循环仅保留两个音效事件槽和过期时间，
+Chime worker 在 Core 0 直接往共享 PSRAM ring 合成音效，仍走 CHIME owner，
+不因喂食/吃食增加任务栈或 DMA 工作区。
 
 `esp_audio_codec` 文档给出的 MP3 44.1 kHz 双声道参考堆占用约 28 KB，
 不含栈。其内部对象的真实分配落点需要运行时跟踪，外部输入/输出已在

@@ -20,6 +20,9 @@ python_scripts\.venv\Scripts\python.exe tools\generate_launcher_icons.py
 输出包含可检查的透明 PNG、启动器 48×48 图标输入及 RGB565/alpha 的
 `small_apps_art.h`，运行时不需要解码 PNG。鱼的水平翻转只用于朝向。
 图标生成器仍保留原有五个图标的处理方式。
+鱼虫参考图保存在 `references\food_worm.png`，只去除外部连通的灰白棋盘背景，
+保留黑色轮廓内的白眼睛和绿色身体。鱼为 40×30，鱼虫为 14×14 透明留边图，
+按原比例缩放，不单独夸大眼睛或修改身体。鱼虫 RGB565/alpha 另占 588 B Flash。
 
 参考图中外围装饰和页面标记保留在完整原件；主体 cutout 用于精灵。
 源图来自用户附件，不宣称其为原创或无版权；分发者须确认有权使用。
