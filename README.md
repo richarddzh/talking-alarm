@@ -21,6 +21,8 @@
   广播；使用 Espressif 官方 MP3 解码组件，并按广播原始采样率输出 I2S。
 - 俄罗斯方块：七种彩色形状、左侧游戏区、右侧积分/消行/下一块提示和开始按钮。
 - 贪吃蛇：方向化头部、身体、转角和尾部块，绿色红斑蛇身、眼睛、舌头和红苹果。
+- 小鱼缸：原图精灵的二维 Boids 鱼群，1–32 条可调，支持暂停。
+- 番茄时钟：25/5/15 分钟专注循环、实际时间表盘、倒计时及豆包语音阶段提醒。
 - SoftAP 配网、SNTP 校时、DS3231 本地走时、整点播报和安静模式。
 - 自动休眠（永远不 / 5 / 10 / 30 分钟）和自动息屏（永远不 / 1 / 5 /
   10 分钟），在设置中切换并保存到 SPIFFS；任意按钮或摇杆动作唤醒。
@@ -75,6 +77,10 @@ esp32_idf_s3n16r8/
     └── modular_app_gui_design.md
 ```
 
+小鱼缸、番茄时钟、原图处理和操作说明见
+[`aquarium_pomodoro.md`](esp32_idf_s3n16r8/docs/aquarium_pomodoro.md)。
+启动器支持三列两行滚动窗口，七个 App 均可用方向键到达。
+
 每个 App 都提供独立的 `tick`、`render`、`activate` 和可选
 `handle_input`。`gui_shell_tick()` 只调用当前打开 App 的事件循环；主界面
 由 Shell 自己处理输入和绘制。游戏和 GUI 在 Core 0，音频 DMA/I2S 任务固定
@@ -128,3 +134,6 @@ idf.py -p COM6 flash monitor
    owner，全部资源清理后释放。DMA 和实时搬运区保留在内部 SRAM。
    具体生命周期和复用约定见
    [`内存与音频资源约定`](esp32_idf_s3n16r8/docs/memory_analysis.md)。
+7. 全彩原图可通过可选 `render_overlay()` 在索引画布提交后绘制；
+   动画合成区放 PSRAM，退出需释放。后台计时任务应由主循环显式服务，
+   不改变 Shell 只 tick 当前 App 的规则。

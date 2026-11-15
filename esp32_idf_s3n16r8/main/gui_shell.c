@@ -5,6 +5,7 @@
 #include "ui_screen.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #define STATUS_Y 208
 #define STATUS_H 32
@@ -18,6 +19,8 @@ static int s_focus = GUI_FOCUS_HOME;
 static bool s_launcher;
 static bool s_launcher_icons_drawn;
 static int s_launcher_icons_focus = GUI_FOCUS_HOME;
+static int s_launcher_first_row;
+static const gui_app_t *s_overlay_app;
 
 static void draw_centered_text(int center_x, int y, const char *text,
                                uint8_t size, ui_color_t color) {
@@ -79,18 +82,34 @@ static void draw_status_bar(const gui_model_t *model) {
 }
 
 static void render_launcher(void) {
+    if (s_focus >= 0) {
+        int row = s_focus / 3;
+        int first = s_launcher_first_row;
+        if (row < first) first = row;
+        if (row > first + 1) first = row - 1;
+        if (first != s_launcher_first_row) {
+            s_launcher_first_row = first;
+            s_launcher_icons_drawn = false;
+            ui_invalidate();
+        }
+    }
     ui_fill_rect(0, 0, APP_UI_W, 32, UI_COLOR_NAVY);
     ui_draw_text(12, 8, "应用", 2, UI_COLOR_TEXT);
     ui_draw_text(12, 38, "请选择一个应用", 1, UI_COLOR_MUTED);
+    char page[24];
+    snprintf(page, sizeof(page), "%d / %d 页", s_launcher_first_row + 1,
+             s_app_count > 6 ? 2 : 1);
+    ui_draw_text(246, 11, page, 1, UI_COLOR_MUTED);
 
     const int card_w = 94;
     const int card_h = 70;
     const int gap = 9;
     for (size_t i = 0; i < s_app_count; ++i) {
         int column = (int)(i % 3);
-        int row = (int)(i / 3);
+        int row = (int)(i / 3) - s_launcher_first_row;
         int x = 9 + column * (card_w + gap);
         int y = 50 + row * (card_h + 3);
+        if (row < 0) continue;
         if (y + card_h > CONTENT_BOTTOM) break;
         bool selected = s_focus == (int)i;
         ui_fill_rect(x, y, card_w, card_h,
@@ -108,9 +127,10 @@ static esp_err_t draw_launcher_icons(void) {
     const int gap = 9;
     for (size_t i = 0; i < s_app_count; ++i) {
         int column = (int)(i % 3);
-        int row = (int)(i / 3);
+        int row = (int)(i / 3) - s_launcher_first_row;
         int x = 9 + column * (card_w + gap);
         int y = 50 + row * (card_h + 3);
+        if (row < 0) continue;
         if (y + card_h > CONTENT_BOTTOM) break;
 
         gui_icon_t icon = s_apps[i]->icon;
@@ -137,6 +157,8 @@ void gui_shell_init(const gui_app_t *const *apps, size_t app_count,
     if (app_count > MAX_GUI_APPS) app_count = MAX_GUI_APPS;
     for (size_t i = 0; i < app_count; ++i) s_apps[i] = apps[i];
     s_app_count = app_count;
+    s_launcher_first_row = 0;
+    s_launcher_icons_drawn = false;
     s_current_app = default_app < app_count ? default_app : 0;
     s_focus = app_count > 0 && s_apps[s_current_app]->focus_count > 0
                   ? 0 : GUI_FOCUS_HOME;
@@ -226,6 +248,12 @@ gui_action_t gui_shell_tick(int64_t now_ms) {
 }
 
 void gui_shell_render(const gui_model_t *model) {
+    const gui_app_t *current = !s_launcher && s_app_count > 0
+                                  ? s_apps[s_current_app] : NULL;
+    if (s_overlay_app && current != s_overlay_app) {
+        ui_invalidate();
+        s_overlay_app = NULL;
+    }
     if (!s_launcher && s_launcher_icons_drawn) {
         ui_invalidate();
         s_launcher_icons_drawn = false;
@@ -239,6 +267,12 @@ void gui_shell_render(const gui_model_t *model) {
     draw_status_bar(model);
     esp_err_t err = ui_flush();
     ESP_ERROR_CHECK_WITHOUT_ABORT(err);
+    if (err == ESP_OK && current && current->render_overlay) {
+        err = current->render_overlay();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(err);
+        s_overlay_app = current;
+        if (err != ESP_OK) ui_invalidate();
+    }
     if (err == ESP_OK && s_launcher &&
         (!s_launcher_icons_drawn || s_launcher_icons_focus != s_focus)) {
         err = draw_launcher_icons();
@@ -267,7 +301,8 @@ void gui_shell_invalidate(void) {
 void gui_shell_exit_game(void) {
     if (s_launcher || s_app_count == 0) return;
     const gui_app_t *app = s_apps[s_current_app];
-    if (app->icon != GUI_ICON_TETRIS && app->icon != GUI_ICON_SNAKE) return;
+    if (app->icon != GUI_ICON_TETRIS && app->icon != GUI_ICON_SNAKE &&
+        app->icon != GUI_ICON_AQUARIUM) return;
     gui_shell_show_launcher();
 }
 

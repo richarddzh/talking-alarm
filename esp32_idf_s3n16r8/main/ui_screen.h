@@ -45,6 +45,11 @@ esp_err_t ui_draw_rgb565_bitmap(int x, int y, int width, int height,
                                 const uint16_t *pixels,
                                 const uint8_t *alpha,
                                 ui_color_t background);
+// Core-0 post-flush sprites: alpha blends against the current indexed canvas.
+esp_err_t ui_draw_rgb565_sprite(int x, int y, int width, int height,
+                                const uint16_t *pixels, const uint8_t *alpha,
+                                bool mirror_x);
+esp_err_t ui_copy_canvas_rgb565(uint16_t *pixels, int x, int y, int width, int height);
 
 // Big clock face with date on top, large HH:MM in middle, small SS on
 // the right, and two small footer lines.

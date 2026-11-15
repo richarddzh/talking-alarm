@@ -15,9 +15,14 @@ Arduino 版在录音/播放时丢帧明显，主要原因是 Arduino-ESP32 在 `
 - 完整 GNU Unifont BMP 中文点阵字体 + UTF-8 渲染
 - 模块化 App Shell、手机式图标主导航和固定底部状态栏
 - Espressif 官方 MP3 解码器驱动的网络电台 App
+- 原图精灵 Boids 小鱼缸、带实际时间表盘及豆包语音提醒的 25/5/15 番茄时钟
 - `esp_wifi` + `esp_event` 直接控制 Wi-Fi STA/AP 切换；连接失败时自动进入设备自建热点配置模式
 
 ## Core 分工（已在 sdkconfig.defaults 显式声明）
+
+新增 App 操作、原图处理和后台计时规则见
+[docs/aquarium_pomodoro.md](docs/aquarium_pomodoro.md)；
+启动器七个 App 使用三列两行滚动窗口，向下可到达番茄时钟。
 
 | 任务                    | 默认/配置                              | 实际所在 Core |
 |-------------------------|----------------------------------------|----------------|

@@ -4,7 +4,8 @@ from PIL import Image
 
 
 ICON_SIZE = 48
-ICON_NAMES = ("chat_alarm", "settings", "radio", "tetris", "snake")
+ICON_NAMES = ("chat_alarm", "settings", "radio", "tetris", "snake",
+              "aquarium", "pomodoro")
 
 
 def rgb565(red: int, green: int, blue: int) -> int:
@@ -73,11 +74,11 @@ def main() -> None:
         f"#define LAUNCHER_ICON_W {ICON_SIZE}\n"
         f"#define LAUNCHER_ICON_H {ICON_SIZE}\n\n"
         "static const uint16_t "
-        "s_launcher_icon_rgb565[5][LAUNCHER_ICON_W * LAUNCHER_ICON_H] = {\n"
+        f"s_launcher_icon_rgb565[{len(ICON_NAMES)}][LAUNCHER_ICON_W * LAUNCHER_ICON_H] = {{\n"
         + "\n".join(pixel_blocks)
         + "\n};\n\n"
         "static const uint8_t "
-        "s_launcher_icon_alpha[5][LAUNCHER_ICON_W * LAUNCHER_ICON_H] = {\n"
+        f"s_launcher_icon_alpha[{len(ICON_NAMES)}][LAUNCHER_ICON_W * LAUNCHER_ICON_H] = {{\n"
         + "\n".join(alpha_blocks)
         + "\n};\n",
         encoding="ascii",

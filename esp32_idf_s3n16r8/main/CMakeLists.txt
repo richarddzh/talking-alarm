@@ -26,6 +26,8 @@ idf_component_register(
         "app_radio.c"
         "app_tetris.c"
         "app_snake.c"
+        "app_aquarium.c"
+        "app_pomodoro.c"
         "radio_stations.c"
         "radio_player.c"
         "st7789.c"

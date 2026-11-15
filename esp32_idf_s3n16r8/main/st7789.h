@@ -20,7 +20,12 @@ esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
 
 // Draws a logical RGB565 bitmap, blending its 8-bit alpha channel over a
 // solid logical RGB565 background before applying the panel color polarity.
+// NULL alpha means an opaque bitmap.
 esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
                                     const uint16_t *pixels,
                                     const uint8_t *alpha,
                                     uint16_t background);
+esp_err_t st7789_draw_rgb565_sprite(int x, int y, int width, int height,
+                                    const uint16_t *pixels, const uint8_t *alpha,
+                                    const uint8_t *canvas,
+                                    const uint16_t palette[16], bool mirror_x);

@@ -25,6 +25,8 @@
 #include "app_radio.h"
 #include "app_tetris.h"
 #include "app_snake.h"
+#include "app_aquarium.h"
+#include "app_pomodoro.h"
 #include "wifi_creds.h"
 #include "wifi_provision.h"
 #include "wifi_time.h"
@@ -93,6 +95,7 @@ static bool s_consume_wake_input;
 static bool s_sleep_hourly_active;
 static bool s_resume_radio;
 static size_t s_resume_radio_station;
+static bool s_pomodoro_speaking;
 
 static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -519,6 +522,7 @@ static void update_idle_power(void) {
         s_button_press_ms = 0;
         s_button_long_handled = false;
         if (target == IDLE_POWER_SLEEP) {
+            app_pomodoro_pause_for_sleep(now_ms());
             s_resume_radio = false;
             s_sleep_hourly_active = false;
             audio_io_set_suspended(true);
@@ -586,6 +590,38 @@ static void maybe_resume_radio(void) {
         ESP_LOGE(TAG, "radio resume failed: %s", esp_err_to_name(err));
         snprintf(s_status_msg, sizeof(s_status_msg), "radio resume failed");
         render_home();
+    }
+}
+
+static void maybe_announce_pomodoro(void) {
+    const char *text = app_pomodoro_announcement(now_ms());
+    if (s_pomodoro_speaking && !chime_player_busy()) {
+        s_pomodoro_speaking = false;
+        if (!text) {
+            app_pomodoro_announcement_done(
+                chime_player_status() == CHIME_DONE ? "语音已播报" : "语音失败，检查网络");
+        }
+    }
+    if (!text) return;
+    if (s_quiet_mode || s_power_state == IDLE_POWER_SLEEP ||
+        s_setup_mode || wifi_provision_active()) {
+        app_pomodoro_announcement_done(s_quiet_mode ? "安静模式，未播报" : "播报已取消");
+        ESP_LOGI(TAG, "pomodoro announcement suppressed by quiet/power/setup");
+        return;
+    }
+    if (!wifi_time_is_connected() || !app_secrets_ready()) {
+        app_pomodoro_announcement_done("检查网络和语音配置");
+        ESP_LOGW(TAG, "pomodoro TTS requires connected Wi-Fi and API keys");
+        return;
+    }
+    if (audio_activity_busy()) return;
+    esp_err_t err = chime_player_start_text(text);
+    if (err == ESP_OK) {
+        app_pomodoro_announcement_done("语音播报中");
+        s_pomodoro_speaking = true;
+    } else {
+        ESP_LOGE(TAG, "pomodoro TTS start failed: %s", esp_err_to_name(err));
+        app_pomodoro_announcement_done("语音启动失败");
     }
 }
 
@@ -829,6 +865,8 @@ static void initialise(void) {
         app_settings_descriptor(),
         app_tetris_descriptor(),
         app_snake_descriptor(),
+        app_aquarium_descriptor(),
+        app_pomodoro_descriptor(),
     };
     gui_shell_init(apps, sizeof(apps) / sizeof(apps[0]), 0);
 
@@ -874,6 +912,8 @@ void app_main(void) {
             handle_button_long_press();
         }
         update_idle_power();
+        app_pomodoro_update(now_ms());
+        maybe_announce_pomodoro();
         if (s_power_state == IDLE_POWER_AWAKE) {
             dispatch_gui_action(gui_shell_tick(now_ms()));
         }

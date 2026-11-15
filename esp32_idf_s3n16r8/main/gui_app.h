@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <esp_err.h>
 
 typedef enum {
     GUI_ICON_CHAT = 0,
@@ -9,6 +10,8 @@ typedef enum {
     GUI_ICON_RADIO,
     GUI_ICON_TETRIS,
     GUI_ICON_SNAKE,
+    GUI_ICON_AQUARIUM,
+    GUI_ICON_POMODORO,
 } gui_icon_t;
 
 typedef enum {
@@ -75,6 +78,8 @@ typedef struct {
     void (*exit)(void);
     gui_action_t (*tick)(int64_t now_ms);
     void (*render)(const gui_model_t *model, int focused_item);
+    // Optional full-color art composited after the indexed canvas is flushed.
+    esp_err_t (*render_overlay)(void);
     gui_action_t (*activate)(uint8_t item);
     bool (*handle_input)(gui_input_t input, gui_action_t *action);
 } gui_app_t;

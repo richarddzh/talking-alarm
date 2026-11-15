@@ -115,6 +115,11 @@ Agent 和 TTS 工作都由 `chime_worker` 完成。TTS 播放阶段与 Voice 使
 停止电台，等待清理完成后报时，再恢复原台。当前没有音频任务队列：
 手动触发遇到 busy 会直接失败；自动调度是否重试由 chime 调度器决定。
 
+番茄时钟在阶段开始/结束时复用 `chime_player_start_text()` 直接请求豆包 TTS，
+不调用 Agent，也不新增音频 owner、PCM 缓冲或 Core 1 工作。
+主循环检查安静/省电/配置模式和网络，忙时最多等待 30 秒，不抢占电台或录音；
+休眠暂停倒计时并取消待播报。细节见 [aquarium_pomodoro.md](aquarium_pomodoro.md)。
+
 ## 超时和错误恢复
 
 - ASR 发送失败：关闭 ASR session，停止录音；停止超时则请求底层 abort。

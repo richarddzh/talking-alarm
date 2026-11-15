@@ -328,6 +328,27 @@ void ui_invalidate(void) {
     s_previous_valid = false;
 }
 
+esp_err_t ui_copy_canvas_rgb565(uint16_t *pixels, int x, int y, int width, int height) {
+    if (!pixels || !s_framebuffer || x < 0 || y < 0 || width < 1 || height < 1 ||
+        x + width > APP_UI_W || y + height > APP_UI_H) return ESP_ERR_INVALID_ARG;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            int px = x + col;
+            uint8_t packed = s_framebuffer[((y + row) * APP_UI_W + px) / 2];
+            uint8_t index = px & 1 ? packed & 0x0F : packed >> 4;
+            pixels[row * width + col] = (uint16_t)~s_palette[index];
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t ui_draw_rgb565_sprite(int x, int y, int width, int height,
+                                const uint16_t *pixels, const uint8_t *alpha,
+                                bool mirror_x) {
+    return st7789_draw_rgb565_sprite(x, y, width, height, pixels, alpha,
+                                     s_framebuffer, s_palette, mirror_x);
+}
+
 esp_err_t ui_draw_rgb565_bitmap(int x, int y, int width, int height,
                                 const uint16_t *pixels,
                                 const uint8_t *alpha,

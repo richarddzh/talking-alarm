@@ -1,5 +1,6 @@
 #include "st7789.h"
 #include "app_config.h"
+#include "rgb565.h"
 
 #include <string.h>
 #include <driver/gpio.h>
@@ -188,26 +189,13 @@ esp_err_t st7789_show_indexed4_region(const uint8_t *framebuffer,
     return ESP_OK;
 }
 
-static uint16_t blend_rgb565(uint16_t foreground, uint16_t background,
-                             uint8_t alpha) {
-    if (alpha == 0) return background;
-    if (alpha == UINT8_MAX) return foreground;
-
-    uint32_t inverse = UINT8_MAX - alpha;
-    uint32_t red = (((foreground >> 11) & 0x1F) * alpha +
-                    ((background >> 11) & 0x1F) * inverse + 127) / 255;
-    uint32_t green = (((foreground >> 5) & 0x3F) * alpha +
-                      ((background >> 5) & 0x3F) * inverse + 127) / 255;
-    uint32_t blue = ((foreground & 0x1F) * alpha +
-                     (background & 0x1F) * inverse + 127) / 255;
-    return (uint16_t)((red << 11) | (green << 5) | blue);
-}
-
-esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
+static esp_err_t draw_rgb565(int x, int y, int width, int height,
                                     const uint16_t *pixels,
                                     const uint8_t *alpha,
-                                    uint16_t background) {
-    if (!pixels || !alpha || x < 0 || y < 0 || width <= 0 || height <= 0 ||
+                                    uint16_t background,
+                                    const uint8_t *canvas,
+                                    const uint16_t *palette, bool mirror_x) {
+    if (!pixels || x < 0 || y < 0 || width <= 0 || height <= 0 ||
         width > APP_TFT_W || x + width > APP_TFT_W ||
         y + height > APP_TFT_H) {
         return ESP_ERR_INVALID_ARG;
@@ -219,9 +207,16 @@ esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
     for (int row = 0; row < height; ++row) {
         size_t row_offset = (size_t)row * width;
         for (int column = 0; column < width; ++column) {
-            size_t pixel = row_offset + column;
-            uint16_t color = blend_rgb565(
-                pixels[pixel], background, alpha[pixel]);
+            size_t pixel = row_offset + (mirror_x ? width - 1 - column : column);
+            uint16_t backdrop = background;
+            if (canvas) {
+                int px = x + column;
+                uint8_t packed = canvas[((y + row) * APP_TFT_W + px) / 2];
+                uint8_t index = px & 1 ? packed & 0x0F : packed >> 4;
+                backdrop = (uint16_t)~palette[index];
+            }
+            uint16_t color = rgb565_blend(
+                pixels[pixel], backdrop, alpha ? alpha[pixel] : UINT8_MAX);
             color = (uint16_t)~color;
             s_line[column * 2] = color >> 8;
             s_line[column * 2 + 1] = color;
@@ -230,4 +225,21 @@ esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
         if (err != ESP_OK) return err;
     }
     return ESP_OK;
+}
+
+esp_err_t st7789_draw_rgb565_bitmap(int x, int y, int width, int height,
+                                    const uint16_t *pixels,
+                                    const uint8_t *alpha,
+                                    uint16_t background) {
+    return draw_rgb565(x, y, width, height, pixels, alpha, background,
+                       NULL, NULL, false);
+}
+
+esp_err_t st7789_draw_rgb565_sprite(int x, int y, int width, int height,
+                                    const uint16_t *pixels, const uint8_t *alpha,
+                                    const uint8_t *canvas,
+                                    const uint16_t palette[16], bool mirror_x) {
+    if (!canvas || !palette) return ESP_ERR_INVALID_ARG;
+    return draw_rgb565(x, y, width, height, pixels, alpha, 0,
+                       canvas, palette, mirror_x);
 }
